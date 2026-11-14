@@ -1,10 +1,21 @@
-# EFF：终末地资源替换框架
+# EFF-HotFix：终末地资源替换框架（Reload 热修版）
 
 [English](README_EN.md)
 
+> [!IMPORTANT]
+> 本仓库基于官方 [ssice-a/EFF](https://github.com/ssice-a/EFF) `v2.0.12` 构建，专门修复游戏内按 `F10`（或自定义 `reload` 热键）动态开关 / 热重载 Mod 时的模型拉丝崩坏与失效问题。
+
+## HotFix 修复内容（v2.0.12-hotfix.1）
+
+- **修复 `0 → 1` 与 `1 → 0 → 1` 热重载模型变形**：补齐 `DemandGenerationReload::Affected()` 对目标角色原版 Mesh 名称（兼容 `(Instance)` / `(Clone)` 实例后缀）的匹配逻辑，解决「未开 Mod 进游戏后再开启 Mod 按 Reload」以及「关闭 Mod 后再次开启」时，场上角色、UI 展示模型与缓存 Prefab 未触发完整重建与骨骼重绑导致的网格拉丝崩坏问题。
+- **修复原生 `AssetBundle` (`CAB-*`) 重名冲突**：在提交 `versionedRoot` 替换包前，自动排空处于 `BundleWaitUnloadState` 的空闲反向依赖代理并安全卸载已驻留的同名原生源包；同时在 `1 → 0` 切回原版直通加载时自动释放合成 `CAB` 身份，杜绝因 Unity 拒绝加载同名 `CAB-*` 而回退旧网格。
+- **双工具链编译兼容**：补充 MSVC 与 Clang / Zig C++ 双编译器兼容支持。
+
+---
+
 EFF 在《明日方舟：终末地》创建资源和实例前应用 Mod。AnimeStudio 导出来源，Blender 制作并编译独立 Mod，EFF DLL 读取结果并完成游戏内加载与热重载。
 
-配套发布：**EFF v2.0.5、EFF Blender v0.50.2、AnimeStudio v1.9.1**。DLL 仅接受 Format 3；旧格式由 EFF Mod Manager v0.2.1 离线迁移。
+配套版本：**EFF v2.0.12-hotfix.1、EFF Blender v0.50.7、EFF Mod Manager v0.2.3、AnimeStudio v1.9.5**。DLL 仅接受 Format 3；旧格式由 EFF Mod Manager 离线迁移。
 
 首次制作 Mod 可先阅读带截图的简易教程：[中文](Mod%20Tutorial.md) · [English](Mod%20Tutorial_EN.md)。
 
@@ -21,7 +32,10 @@ EFF 在《明日方舟：终末地》创建资源和实例前应用 Mod。AnimeS
 
 ## 安装
 
-从 [EFF Releases](https://github.com/ssice-a/EFF/releases) 下载 `EFF_v2.0.5_dll.zip`。退出游戏，将 ZIP 解压到 `Endfield.exe` 所在目录。当前代理转发支持 Windows 系统目录为 `C:\Windows` 的安装；其他系统目录尚不支持。更新时保留自己的 `plugin/eff.ini`、`plugin/mods/` 和各 Mod 的 `state.ini`。
+前往 [EFF-HotFix Releases](https://github.com/BakaMai/EFF-HotFix/releases/latest) 按你的环境选择对应文件（操作前请先退出游戏）：
+
+- **已有 EFF 升级 / 与 EFMI 共存用户（推荐）**：下载单文件 **`eff.dll`**，直接覆盖 `Endfield.exe` 所在目录下的 `plugin/eff.dll`。此方式不会覆盖你原有的 `plugin/eff.ini` 快捷键设置，也不会覆盖 EFMI 或 [EFF-EFMI-Compatibility-Plugin](https://github.com/BakaMai/EFF-EFMI-Compatibility-Plugin) 的加载器文件。
+- **全新独立安装 EFF**：下载完整包 **`EFF_v2.0.12-hotfix.1_dll.zip`**，解压到 `Endfield.exe` 所在目录（当前代理转发支持 Windows 系统目录为 `C:\Windows` 的安装）。
 
 ```text
 d3dcompiler_47.dll
