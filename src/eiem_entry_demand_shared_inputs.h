@@ -1116,10 +1116,9 @@ bool PrepareDependencyGroup(const std::shared_ptr<Manifest>& manifest,uint64_t h
   group.keys=native;group.keys.push_back(hash);
   auto routing=manifest;
   if(!manifest->unresolved.empty()){
-    std::set<size_t> alreadyDiscovered;
-    for(const auto& binding:shared->discoveredTargets)alreadyDiscovered.insert(binding.target);
-    std::vector<size_t> pendingUnresolved;
-    for(auto index:manifest->unresolved)if(!alreadyDiscovered.count(index))pendingUnresolved.push_back(index);
+    // A bundle seen for the first time is searched for every unresolved target, found elsewhere or not:
+    // one target can sit in several bundles (a battle prefab and a UI showcase), and each copy needs its binding.
+    const auto& pendingUnresolved=manifest->unresolved;
     if(!pendingUnresolved.empty()){
       // Request-local routing snapshots keep the published manifest immutable.
       // Negative directory checks are cached once per native input/generation.
