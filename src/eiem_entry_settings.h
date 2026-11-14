@@ -12,8 +12,8 @@ class EiemEntrySettings {
   static Snapshot Prepare(const EiemGlobalConfig& value) {return std::make_shared<const EiemGlobalConfig>(value);}
   void Publish(const EiemGlobalConfig& value) {PublishPrepared(Prepare(value));}
   void PublishPrepared(const Snapshot& value) noexcept {std::atomic_store(&published,value);}
-  static EiemGlobalConfig Read(const std::filesystem::path& game) {
-    auto path=game/"plugin/eff.ini";
+  static EiemGlobalConfig Read(const std::filesystem::path& game, const std::filesystem::path& data = {}) {
+    auto path=(data.empty()?game/"plugin":data)/"eff.ini";
     if (!std::filesystem::exists(path)) {
       std::filesystem::create_directories(path.parent_path());
       std::ofstream out(path,std::ios::binary);out<<kEiemDefaultGlobalConfig;

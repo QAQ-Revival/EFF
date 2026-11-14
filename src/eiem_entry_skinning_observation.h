@@ -411,7 +411,7 @@ void __fastcall SetBones(void *self, void *bones, void *info) {
   Observe([&] { ReadRenderer(self, "Game.set_bones.after"); });
 }
 void InstallReadback(void **assemblies, size_t count) {
-  if (!std::filesystem::exists(gameDirectory / "plugin" / "resource-input-diagnostics" / "skinning-observation.enabled")) return;
+  if (!std::filesystem::exists(effDirectory / "resource-input-diagnostics" / "skinning-observation.enabled")) return;
   auto object = FindClass("UnityEngine", "Object", assemblies, count);
   auto component = FindClass("UnityEngine", "Component", assemblies, count);
   auto transform = FindClass("UnityEngine", "Transform", assemblies, count);

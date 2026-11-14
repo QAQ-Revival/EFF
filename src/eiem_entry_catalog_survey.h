@@ -150,7 +150,7 @@ void Capture(void* manifest,void* prototype,const ManifestState& state){
    if(queryFailures==1)Log("[CATALOG-SURVEY-SOURCE-REJECT] bundle=%s reason=%s",label.c_str(),error.what());}
  }
  auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();report<<"],\"mountedQueryFailures\":"<<queryFailures<<",\"nativeDirectQueriesVerified\":"<<verified.size()<<",\"surveyMs\":"<<elapsed<<"}";
- auto text=report.str();auto output=gameDirectory/"plugin/catalog-survey.json";EiemOfflineCompile::AtomicSave(output,Bytes(text.begin(),text.end()));
+ auto text=report.str();auto output=effDirectory/"catalog-survey.json";EiemOfflineCompile::AtomicSave(output,Bytes(text.begin(),text.end()));
  Log("[CATALOG-SURVEY-READY] bundles=%d selectedDirectQueries=%zu mountedQueryFailures=%zu totalMs=%.3f report=%s pfbReads=0 modFilesModified=0",count,verified.size(),queryFailures,elapsed,output.u8string().c_str());
 }
 void Observe(void* manifest,void* prototype){

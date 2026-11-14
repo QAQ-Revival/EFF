@@ -37,7 +37,7 @@ bool Finished(void* self, void* methodInfo) {
 }
 void InstallOptional(void** assemblies, size_t count) {
 #if defined(EIEM_DIAGNOSTICS)
-  if (!afterFinished && !std::filesystem::exists(gameDirectory/"plugin/resource-input-diagnostics/capture-observation.enabled")) return;
+  if (!afterFinished && !std::filesystem::exists(effDirectory/"resource-input-diagnostics/capture-observation.enabled")) return;
 #else
   if (!afterFinished) return;
 #endif

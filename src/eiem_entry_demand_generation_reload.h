@@ -191,7 +191,7 @@ void Prepare() {
     Require(bool(candidate->generation),"Format 3 F10 candidate generation is absent");
     Require(DemandLoadingProbe::InstalledGenerationFilesUnchanged(*candidate->generation),
       "Format 3 Mod files changed while F10 declarations were prepared");
-    candidate->config=EiemEntrySettings::Read(gameDirectory);
+    candidate->config=EiemEntrySettings::Read(gameDirectory,effDirectory);
     std::set<std::string> excluded;auto expected=candidate->config.reload.vk,gui=candidate->config.gui.vk;
     for(const auto& package:*candidate->generation->packages){
       try{

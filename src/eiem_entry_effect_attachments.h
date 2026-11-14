@@ -45,8 +45,8 @@ void PrepareDiskReload(bool force=true){try{
  std::map<std::string,std::map<std::string,EffectAttachment>> attached;
  auto graph=std::atomic_load(&published);if(graph)for(const auto& p:*graph)attached[p.id]=p.effects;
 #else
- StandaloneEffects::PublishReadLock publication(gameDirectory/"plugin/mods");
- auto own=std::make_shared<const std::vector<Package>>(StandaloneEffects::ReadAll(gameDirectory));std::map<std::string,std::map<std::string,EffectAttachment>> attached;auto config=settings.Get();
+ StandaloneEffects::PublishReadLock publication(effDirectory/"Mods");
+ auto own=std::make_shared<const std::vector<Package>>(StandaloneEffects::ReadAll(gameDirectory,effDirectory/"Mods"));std::map<std::string,std::map<std::string,EffectAttachment>> attached;auto config=settings.Get();
  for(const auto& p:*own)for(const auto& key:p.bindings)Require(key.key.vk!=config.reload.vk&&key.key.vk!=config.gui.vk,"effect Mod key overlaps global shortcut");
  auto graph=std::atomic_load(&published);if(graph)for(const auto& p:*graph)attached[p.id]=StandaloneEffects::ReadAttached(p);
 #endif

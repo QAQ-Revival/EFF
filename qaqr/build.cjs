@@ -5,8 +5,9 @@ const { spawnSync } = require('node:child_process');
 const root = path.resolve(__dirname, '..');
 const UPSTREAM = 'https://github.com/ssice-a/EFF.git';
 const OUTPUT_FOLDER = 'bin/resource-directory-entry-format3';
-// Where each file of the build goes in the game directory, as in the official EFF_v<version>_dll.zip.
+// Keep the upstream archive layout; QAQR installs plugin files beside its external loader in data/EFF.
 const LAYOUT = {
+  'EFFLoader.exe': `${OUTPUT_FOLDER}/EFFLoader.exe`,
   'd3dcompiler_47.dll': `${OUTPUT_FOLDER}/d3dcompiler_47.dll`,
   'vulkan-1.dll': `${OUTPUT_FOLDER}/vulkan-1.dll`,
   'plugin/eff.dll': `${OUTPUT_FOLDER}/eff.dll`,
@@ -50,7 +51,7 @@ function peVersion(bytes) {
   const read = offset => { const high = bytes.readUInt32LE(fixed + offset), low = bytes.readUInt32LE(fixed + offset + 4); return [high >>> 16, high & 0xffff, low >>> 16, low & 0xffff].join('.'); };
   return { file: read(8), product: read(16) };
 }
-function build({ output = path.join(root, 'build/component'), verifyOnly = false } = {}) {
+function build({ output = path.join(root, 'build/component'), verifyOnly = false, allowDirty = false } = {}) {
   const { base, revision, version } = qaqrVersion();
   // build.bat finds MSVC itself and links the static runtime (/MT). cmd may not search the current directory.
   const result = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `""${path.join(root, 'build.bat')}""`], {
@@ -60,7 +61,8 @@ function build({ output = path.join(root, 'build/component'), verifyOnly = false
   const built = peVersion(fs.readFileSync(path.join(root, LAYOUT['plugin/eff.dll'])));
   if (built?.file !== version || built.product !== version) throw Error(`eff.dll carries version ${built?.file || 'none'}, expected ${version}`);
   if (verifyOnly) return;
-  if (git(['status', '--porcelain', '--ignore-submodules=all']).stdout) throw Error('Commit the reviewed EFF source before packaging');
+  const sourceDirty = !!git(['status', '--porcelain', '--ignore-submodules=all']).stdout;
+  if (sourceDirty && !allowDirty) throw Error('Commit the reviewed EFF source before release packaging, or use allowDirty for a local development build');
   output = path.resolve(output);
   fs.rmSync(output, { recursive: true, force: true });
   const files = {};
@@ -72,7 +74,8 @@ function build({ output = path.join(root, 'build/component'), verifyOnly = false
   }
   fs.writeFileSync(path.join(output, 'component.json'), JSON.stringify({
     source: 'https://github.com/QAQ-Revival/EFF', sourceCommit: git(['rev-parse', 'HEAD']).stdout, version,
-    upstream: { repository: 'ssice-a/EFF', commit: base }, gameRuntimeValidated: false, files
+    upstream: { repository: 'ssice-a/EFF', commit: base }, gameRuntimeValidated: false,
+    externalData: 1, ...(sourceDirty ? { localBuild: true, sourceDirty: true } : {}), files
   }, null, 2) + '\n');
   return output;
 }

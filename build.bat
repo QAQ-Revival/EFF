@@ -64,6 +64,11 @@ cl /nologo /O2 /MT /LD /EHsc /std:c++17 ^
  /Fo"%entry_folder%\proxy_vulkan_full.obj" src\proxy_vulkan_full.cpp ^
  /Fe"%entry_folder%\vulkan-1.dll" /link /DLL
 if errorlevel 1 goto entry_failed
+echo Building the external QAQR loader ...
+cl /nologo /utf-8 /O2 /MT /EHsc /std:c++17 /W4 ^
+ /Fo"%entry_folder%\eff_loader.obj" src\eff_loader.cpp ^
+ /Fe"%entry_folder%\EFFLoader.exe" /link /SUBSYSTEM:WINDOWS shell32.lib
+if errorlevel 1 goto entry_failed
 echo [4/5] Writing DLL data structure declaration ...
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\write_package_protocol.ps1 -Output "%entry_folder%\package-protocol.json"
 if errorlevel 1 goto entry_failed

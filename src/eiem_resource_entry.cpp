@@ -189,7 +189,8 @@ void FlushLogs() {
   lastLogFlushTick = GetTickCount64();
   logDirty = false;
 }
-std::filesystem::path gameDirectory, sessionDirectory;
+std::filesystem::path gameDirectory, effDirectory, sessionDirectory;
+HMODULE runtimeModule = nullptr;
 std::atomic_bool active{true}, reload{false};
 std::atomic<uint64_t> reloadClock{0};
 std::atomic<unsigned> generation{0};
@@ -255,7 +256,7 @@ std::string SnapshotPath(std::string path) {
 void LoadSnapshotSelection() {
   // Temporary diagnostic selection, outside Mod contents. It selects copies
   // only; actual resource matches still use the decoded path + asset identity.
-  auto path = gameDirectory / "plugin" / "resource-input-diagnostics" /
+  auto path = effDirectory / "resource-input-diagnostics" /
               "snapshot-ranges.tsv";
   if (!std::filesystem::exists(path))
     return;
@@ -563,13 +564,13 @@ void ApplyEntryHookBatch(){
     entryHookLookupMs,entryHookPatchMs,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count(),names.c_str());
 }
 std::vector<std::filesystem::path> DiscoverModRoots() {
-  return EiemComposedPackage::Roots(gameDirectory/"plugin/mods",true);
+  return EiemComposedPackage::Roots(effDirectory/"Mods",true);
 }
 bool InstalledAuthorsMatch(const std::vector<Package>& graph) {
- return EiemComposedPackage::Matches(gameDirectory/"plugin/mods",graph);
+ return EiemComposedPackage::Matches(effDirectory/"Mods",graph);
 }
 void LoadInitialPackages() {
-  auto config=EiemEntrySettings::Read(gameDirectory);
+  auto config=EiemEntrySettings::Read(gameDirectory,effDirectory);
   auto next=DemandLoadingProbe::ReadInstalledPackages();
   for(const auto& p:*next) for(const auto& key:p.bindings)
     Require(key.key.vk!=config.reload.vk && key.key.vk!=config.gui.vk,"Mod key overlaps reserved global shortcut: "+p.id+"/"+key.id);
@@ -1554,6 +1555,9 @@ DWORD StartImpl() {
   wchar_t executable[32768] = {};
   GetModuleFileNameW(nullptr, executable, _countof(executable));
   gameDirectory = std::filesystem::path(executable).parent_path();
+  wchar_t runtimePath[32768] = {};
+  Require(GetModuleFileNameW(runtimeModule, runtimePath, _countof(runtimePath)) != 0, "EFF module path unavailable");
+  effDirectory = std::filesystem::path(runtimePath).parent_path();
 #if defined(EIEM_DIAGNOSTICS)
   FILETIME created{}, exited{}, kernel{}, user{};
   Require(
@@ -1564,13 +1568,13 @@ DWORD StartImpl() {
            GetCurrentProcessId(), created.dwHighDateTime,
            created.dwLowDateTime);
   sessionDirectory =
-      gameDirectory / "plugin" / "resource-input-diagnostics" / runName;
+      effDirectory / "resource-input-diagnostics" / runName;
   std::filesystem::create_directories(sessionDirectory);
   auto logPath = sessionDirectory / "entry.log";
   logFile = OpenLog(logPath, true);
 #else
-  std::filesystem::create_directories(gameDirectory / "plugin");
-  auto logPath = gameDirectory / "plugin" / "eff_log.txt";
+  std::filesystem::create_directories(effDirectory);
+  auto logPath = effDirectory / "eff_log.txt";
   logFile = OpenLog(logPath);
 #endif
   if (!logFile) {
@@ -1579,7 +1583,7 @@ DWORD StartImpl() {
     return 1;
   }
 #if defined(EIEM_DIAGNOSTICS)
-  logMirror = OpenLog(gameDirectory / "plugin" / "eff_log.txt");
+  logMirror = OpenLog(effDirectory / "eff_log.txt");
 #endif
   Log("[BUILD] resource-directory-entry %s %s pid=%lu package-contract=structures "
 #if defined(EIEM_FORMAT3_RUNTIME)
@@ -1774,6 +1778,8 @@ void Log(const char *format, ...) {
 }
 AP_PluginInfo info = {APPLEPIE_PLUGIN_API_VERSION, "eff",     "EFF",
                       "Resource input validation", "eff.ini", true};
+// Capability exported for managers: all EFF-owned files are relative to eff.dll.
+APPLEPIE_PLUGIN_EXPORT int EFF_ExternalData_v1() { return 1; }
 APPLEPIE_PLUGIN_EXPORT AP_PluginInfo *AP_GetPluginInfo() { return &info; }
 APPLEPIE_PLUGIN_EXPORT bool AP_PluginEnable() {
   Entry::active = true;
@@ -1817,6 +1823,7 @@ APPLEPIE_PLUGIN_EXPORT void AP_SetLanguage(const char *) {}
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_DETACH) {Entry::RuntimeShapes::managedAlive=false;Entry::RuntimeControls::panel.stopping=true;}
   if (reason == DLL_PROCESS_ATTACH) {
+    Entry::runtimeModule = module;
 #if defined(_DLL)
     DisableThreadLibraryCalls(module);
 #endif

@@ -1021,15 +1021,15 @@ void PollCompiled(bool trigger){
  static std::string lastError,failedStamp;
  auto clock=trigger&&reloadClock.load()?reloadClock.load():NativeBundle::Clock();
  try{
-  auto stamp=EiemCompiledModSet::DirectoryStamp(gameDirectory/"plugin/mods");if(!trigger&&!failedStamp.empty()&&stamp==failedStamp)return;
-  if(!preparedCompiledSet||!EiemCompiledModSet::Unchanged(*preparedCompiledSet,gameDirectory/"plugin/mods"))preparedCompiledSet=EiemCompiledModSet::Read(gameDirectory,preparedCompiledSet);
+  auto stamp=EiemCompiledModSet::DirectoryStamp(effDirectory/"Mods");if(!trigger&&!failedStamp.empty()&&stamp==failedStamp)return;
+  if(!preparedCompiledSet||!EiemCompiledModSet::Unchanged(*preparedCompiledSet,effDirectory/"Mods"))preparedCompiledSet=EiemCompiledModSet::Read(gameDirectory,preparedCompiledSet,effDirectory/"Mods");
   if(!preparedCompiledSet)return;auto pointer=preparedCompiledSet->pointer;auto failed=std::atomic_load(&failedKey);bool retry=trigger&&failed&&*failed==pointer.key;
   if(pointer!=lastPrepared||retry||!diskPrepared||!SameAuthorSnapshot(*diskPrepared,*preparedCompiledSet)){
    bool refresh=diskPrepared&&pointer==diskPrepared->pointer&&!retry;
    auto p=std::make_shared<Prepared>();p->pointer=pointer;p->base=generation.load();p->graph=std::make_shared<const std::vector<Package>>(preparedCompiledSet->manifest.packages);p->authorFiles=preparedCompiledSet->files;p->plan=std::make_shared<const Plan>(preparedCompiledSet->manifest.plan);
    if(refresh)p->rules=diskPrepared->rules;else p->rules=EiemCompiledModSet::Context(preparedCompiledSet);p->ruleInputs=std::move(preparedCompiledSet->isolated);p->ruleViews=preparedCompiledSet->views;
    if(retry)for(auto index:p->plan->closure)if(!p->ruleInputs.count(index)&&!p->ruleViews.count(index))p->ruleInputs.emplace(index,std::make_shared<const Bytes>(p->rules->Materialize(index,true)));
-   auto config=EiemEntrySettings::Read(gameDirectory);
+   auto config=EiemEntrySettings::Read(gameDirectory,effDirectory);
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
    p->demandGeneration=DemandLoadingProbe::PrepareInstalledGeneration(p->graph);
 #endif
@@ -1042,7 +1042,7 @@ void PollCompiled(bool trigger){
    Log("[FULL-RELOAD-PREPARED] key=%s workerMs=%.6f compiledPerMod=1 authorCompilation=0 nativeSubmission=pendingUnityFrame",pointer.key.c_str(),NativeBundle::Ms(clock));
   }
   std::atomic_store(&latest,std::make_shared<const EiemOfflinePackage::Pointer>(pointer));
-  if(trigger){auto ticket=std::make_shared<Ticket>();ticket->pointer=pointer;ticket->clock=clock;auto config=EiemEntrySettings::Read(gameDirectory);
+  if(trigger){auto ticket=std::make_shared<Ticket>();ticket->pointer=pointer;ticket->clock=clock;auto config=EiemEntrySettings::Read(gameDirectory,effDirectory);
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
    ticket->demandGeneration=diskPrepared->demandGeneration;
 #endif
@@ -1054,7 +1054,7 @@ void PollCompiled(bool trigger){
 #endif
    );ticket->config=EiemEntrySettings::Prepare(config);std::atomic_store(&requested,std::shared_ptr<const Ticket>(ticket));Log("[FULL-RELOAD-REQUEST] key=%s compiledPerMod=1 authorCompilation=0",pointer.key.c_str());}
   lastError.clear();failedStamp.clear();
- }catch(const std::exception& e){try{failedStamp=EiemCompiledModSet::DirectoryStamp(gameDirectory/"plugin/mods");}catch(...){failedStamp.clear();}std::atomic_store(&latest,std::shared_ptr<const EiemOfflinePackage::Pointer>{});std::atomic_store(&requested,std::shared_ptr<const Ticket>{});if(trigger||lastError!=e.what()){lastError=e.what();Log("[FULL-RELOAD-REJECT] phase=compiled-mod reason=%s previousGenerationRetained=%u",e.what(),generation.load());}}
+ }catch(const std::exception& e){try{failedStamp=EiemCompiledModSet::DirectoryStamp(effDirectory/"Mods");}catch(...){failedStamp.clear();}std::atomic_store(&latest,std::shared_ptr<const EiemOfflinePackage::Pointer>{});std::atomic_store(&requested,std::shared_ptr<const Ticket>{});if(trigger||lastError!=e.what()){lastError=e.what();Log("[FULL-RELOAD-REJECT] phase=compiled-mod reason=%s previousGenerationRetained=%u",e.what(),generation.load());}}
 }
 void PollOffline(bool trigger=false,bool allowBuild=true){
  (void)allowBuild;PollCompiled(trigger);

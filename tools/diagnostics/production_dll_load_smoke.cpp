@@ -20,9 +20,9 @@ int wmain(int argc,wchar_t** argv) {
   if(argc!=3){fwprintf(stderr,L"usage: production_dll_load_smoke <eff.dll> <host-runtime-directory>\n");return 1;}
   SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
   SetUnhandledExceptionFilter(Crash);
-  wchar_t executable[32768]{};GetModuleFileNameW(nullptr,executable,32768);
+  wchar_t executable[32768]{};GetFullPathNameW(argv[1],32768,executable,nullptr);
   auto slash=wcsrchr(executable,L'\\');if(!slash)return 1;*slash=0;
-  wchar_t logPath[32768];swprintf_s(logPath,L"%ls\\plugin\\eff_log.txt",executable);
+  wchar_t logPath[32768];swprintf_s(logPath,L"%ls\\eff_log.txt",executable);
   // Clear only this harness's log, so a previous run cannot mask worker failure.
   auto cleanLog=CreateFileW(logPath,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
                            nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);

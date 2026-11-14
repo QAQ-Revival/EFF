@@ -277,7 +277,7 @@ void InventoryType(void* klass,const char* label) {
 void InstallOptional(void** assemblies,size_t count) {
   if(enabled)return;
   try {
-    if(!std::filesystem::exists(gameDirectory/"plugin/resource-input-diagnostics/full-reload-observation.enabled"))return;
+    if(!std::filesystem::exists(effDirectory/"resource-input-diagnostics/full-reload-observation.enabled"))return;
     Require(il2cpp_class_get_fields && il2cpp_class_get_parent && il2cpp_field_get_name && il2cpp_field_get_type && il2cpp_field_get_flags && il2cpp_field_get_offset && il2cpp_field_get_value && il2cpp_type_get_name && il2cpp_free,"reload probe metadata/field API unavailable");
     LARGE_INTEGER f{};Require(QueryPerformanceFrequency(&f) && f.QuadPart>0,"reload probe clock unavailable");frequency=uint64_t(f.QuadPart);enabled=true;
     auto helperClass=FindClass("Beyond.Gameplay.View","EntityRenderHelper",assemblies,count);

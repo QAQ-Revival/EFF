@@ -287,7 +287,7 @@ void ObserveProxy(void* source,uint64_t hash,void* asset=nullptr){
 }
 void InstallOptional(void** assemblies,size_t count){
  try{
-  auto configurationFile=gameDirectory/"plugin/resource-adaptation-probe/probe.tsv";if(!std::filesystem::is_regular_file(configurationFile))return;
+  auto configurationFile=effDirectory/"resource-adaptation-probe/probe.tsv";if(!std::filesystem::is_regular_file(configurationFile))return;
   auto raw=EiemDirectory::Read(configurationFile);std::istringstream lines(std::string(raw.begin(),raw.end()));std::string line;
   Require(bool(std::getline(lines,line))&&line=="EFF_PREFAB_ADAPTATION_PROBE/mesh+source+layout/tsv","adaptation probe configuration header differs");
   Require(bool(std::getline(lines,line)),"adaptation probe configuration absent");auto fields=EiemNativeInput::TabFields(line);Require(fields.size()==8,"adaptation probe configuration fields differ");

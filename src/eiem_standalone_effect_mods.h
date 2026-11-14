@@ -29,8 +29,8 @@ inline std::map<std::string,EffectAttachment> ReadAttached(const Package& publis
  }
  RestoreRuntimeControls(next);Require(EiemDirectory::Read(published.root/"mod.ini")==ini,"effect declarations changed during reload; retry F10");return std::move(next.effects);
 }
-inline std::vector<Package> ReadAll(const std::filesystem::path& game){
- std::vector<Package> result;std::set<std::string> ids;for(const auto& root:EiemComposedPackage::Roots(game/"plugin/mods",true)){
+inline std::vector<Package> ReadAll(const std::filesystem::path& game,const std::filesystem::path& mods = {}){
+ std::vector<Package> result;std::set<std::string> ids;for(const auto& root:EiemComposedPackage::Roots(mods.empty()?game/"plugin/mods":mods,true)){
   if(!IsStandalone(root))continue;
   auto p=Load(root);Require(p.parts.empty()&&p.rules.empty()&&!p.effects.empty(),"standalone effect Mod contains character edits");
   for(const auto& e:p.effects){const auto& effect=e.second;Require(IsGamePrefabReplacement(effect)||( !effect.targetPrefab.empty()&&!effect.targetPath.empty()&&!effect.targetAsset.empty()&&(effect.bone.empty()||!effect.targetBones.empty())),"standalone effect lacks an exact Prefab replacement target or source attachment proof");}

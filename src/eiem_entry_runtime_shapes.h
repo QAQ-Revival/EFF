@@ -135,7 +135,7 @@ void RequestGpuCapture(unsigned assignments) {
     }
     Require(gpuCaptureApi->TriggerCapture && gpuCaptureApi->GetNumCaptures && gpuCaptureApi->GetCapture &&
             gpuCaptureApi->SetCaptureFilePathTemplate && gpuCaptureApi->IsFrameCapturing,"GfxTrace public capture API incomplete");
-    auto prefix=gameDirectory/"plugin/resource-input-diagnostics"/
+    auto prefix=effDirectory/"resource-input-diagnostics"/
       ("body-afterimage-v24-pid"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64()));
     gpuCaptureApi->SetCaptureFilePathTemplate(prefix.u8string().c_str());
     gpuCaptureFirst=gpuCaptureApi->GetNumCaptures();
@@ -446,7 +446,7 @@ bool RequestMatrices(void* renderer,void* pointer,int size) {
         renderer,size,palette->second.size(),int(result));
 #if defined(EIEM_DIAGNOSTICS)
     if (result && traceBoundaries && snapshotSequence<=3) try {
-      const auto path=gameDirectory/"plugin/resource-input-diagnostics"/
+      const auto path=effDirectory/"resource-input-diagnostics"/
         ("capture-palette-v24-pid"+std::to_string(GetCurrentProcessId())+"-seq"+std::to_string(snapshotSequence)+".bin");
       std::ofstream file(path,std::ios::binary|std::ios::trunc);
       file.write(reinterpret_cast<const char*>(palette->second.data()),size);
@@ -1039,9 +1039,9 @@ void InstallOptional(void** assemblies,size_t count) {
     installIcall("UnityEngine.SkinnedMeshRenderer::RequestCurrentFrameSkinMatrices",(void*)RequestMatrices,(void**)&originalMatrixRequest);
     Log("[SHAPE-CAPTURE-MATRIX-API] installed=1 perRendererSlots=1 publicTransforms=1 synchronousRefusalFallback=1");
 #if defined(EIEM_DIAGNOSTICS)
-    traceBoundaries=std::filesystem::exists(gameDirectory/"plugin/resource-input-diagnostics/shape-capture-boundaries.enabled");
+    traceBoundaries=std::filesystem::exists(effDirectory/"resource-input-diagnostics/shape-capture-boundaries.enabled");
 #if defined(EIEM_SHAPE_CAPTURE_GFXTRACE)
-    gpuCaptureEnabled=std::filesystem::exists(gameDirectory/"plugin/resource-input-diagnostics/shape-capture-gpu.enabled");
+    gpuCaptureEnabled=std::filesystem::exists(effDirectory/"resource-input-diagnostics/shape-capture-gpu.enabled");
 #endif
     if (traceBoundaries) {
       // Optional evidence must never disable the working runtime shape bridge.
