@@ -7,6 +7,9 @@ set "entry_folder=bin\resource-directory-entry-format3"
 set "entry_capture="
 set "entry_effects="
 set "entry_option=%~1"
+rem A downstream build numbers itself with EFF_VERSION_REVISION, the fourth part of the DLL version.
+set "entry_rc="
+if defined EFF_VERSION_REVISION set "entry_rc=/dEIEM_VERSION_REVISION=%EFF_VERSION_REVISION%"
 if not "%entry_option%"=="" if /i not "%entry_option%"=="capture" if /i not "%entry_option%"=="load-perf" if /i not "%entry_option%"=="effects-debug" (
  echo [ERROR] Expected capture, load-perf or effects-debug.
  goto entry_failed
@@ -37,7 +40,7 @@ rem Game installs may preload older app-local MSVC runtimes. Keep the plugin
 rem and its UI implementation self-contained instead of sharing that runtime.
 call tools\build_imgui.cmd static
 if errorlevel 1 goto entry_failed
-rc /nologo /fo "%entry_folder%\version.res" src\version.rc
+rc /nologo %entry_rc% /fo "%entry_folder%\version.res" src\version.rc
 if errorlevel 1 goto entry_failed
 cl /nologo /utf-8 /O2 /Zi /MT /LD /EHsc /std:c++17 /bigobj /W4 ^
  /DEIEM_FORMAT3_RUNTIME=1 %entry_capture% %entry_effects% /DEIEM_STATIC_RUNTIME=1 /Ideps\minhook_lib\include ^
