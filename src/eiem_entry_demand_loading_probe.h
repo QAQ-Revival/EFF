@@ -119,7 +119,7 @@ void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const st
         EiemNativeInput::Asset observed;const EiemNativeInput::Asset* selected=nullptr;
         if(binding.object&&nativeName(binding.cab)==nativeName(member.name)){auto object=layout.objects.find(binding.object);if(object!=layout.objects.end()&&layout.types.at(object->second.type).classId==43){observed.cab=member.name;observed.pathId=binding.object;observed.classId=43;observed.type=layout.types.at(object->second.type).hash;selected=&observed;}}
         auto hashed=hashes.find(binding.asset);if(!selected&&binding.asset&&hashed!=hashes.end()&&hashed->second.classId==43&&nativeName(hashed->second.cab)==nativeName(member.name))selected=&hashed->second;
-        if(!selected){if(names.empty())names=reader.Assets(member,layout);for(const auto& candidate:names)if(candidate.classId==43&&candidate.cab==member.name&&nativeName(candidate.path)==nativeName(target.source.path)&&candidate.asset==target.source.asset){selected=&candidate;break;}}
+        if(!selected){if(names.empty())names=reader.AssetsFiltered(member,layout,nullptr,43);for(const auto& candidate:names)if(candidate.classId==43&&candidate.cab==member.name&&nativeName(candidate.path)==nativeName(target.source.path)&&candidate.asset==target.source.asset){selected=&candidate;break;}}
         if(!selected)continue;auto asset=*selected;asset.path=target.source.path;asset.asset=target.source.asset;
         if(target.skip)Log("[DEMAND-SKIP-MESH] token=%llu mod=%s target=%s#%s cab=%s pathId=%lld",token,target.mod.c_str(),target.source.path.c_str(),target.source.asset.c_str(),asset.cab.c_str(),asset.pathId);
         auto& targetsForMod=selectedByMod[target.mod];Require(targetsForMod.emplace(target.source,std::move(asset)).second,"two manifest bindings resolved one native Mesh identity");bindingIndices[target.mod].insert(binding.target);
@@ -223,13 +223,15 @@ void VerifyAsset(uint64_t token,void* object){
   std::vector<void*> renderers;
   if(!strcmp(name,"GameObject")){bool inactive=true;void* args[]={RuntimeShapes::api.rendererType,&inactive};auto values=Ref::Make(Call(RuntimeShapes::api.modelRenderers,object,args),false);renderers=FullResourceReload::ReferenceArray(values.Get());}
   auto check=[&](void* mesh,void* renderer){if(!mesh)return;auto meshName=String(Call(RuntimeShapes::api.name,mesh));for(const auto& row:loaded)for(const auto& markerEntry:row.second.author->markers){const auto& partId=markerEntry.first;const auto& marker=markerEntry.second;if(meshName!=marker)continue;
+    Identity source;bool hasSource=false;for(const auto& target:row.second.author->package.targetIndex){const auto& rule=row.second.author->package.rules.at(target.second);
+      if(std::find(rule.parts.begin(),rule.parts.end(),partId)!=rule.parts.end()){source=target.first;hasSource=true;break;}}
+    Require(hasSource,"native readback part has no source Mesh target");auto native=row.second.targets.find(source);Require(native!=row.second.targets.end(),"native readback source Mesh identity is absent");
+    {std::lock_guard<std::mutex> lock(mutex);auto key=std::make_tuple(record.scope,source.path,source.asset,partId);
+      auto prior=nativeMeshObservations.find(key);if(prior!=nativeMeshObservations.end()&&prior->second.bundleInputs.count(record.name))return;}
     const auto& expected=row.second.author->package.meshes.at(partId);
     auto vertices=RuntimeShapes::Scalar<int>(RuntimeShapes::api.vertexCount,mesh);auto shapes=RuntimeShapes::Scalar<int>(RuntimeShapes::api.shapeCount,mesh);
     auto poses=Ref::Make(Call(RuntimeShapes::api.bindPoses,mesh),false);size_t bindCount=0;Require(ArrayLength(poses.Get(),&bindCount),"demand native bindpose readback absent");
     size_t boneCount=0;if(renderer&&RuntimeShapes::RendererKind(renderer)==137){auto bones=Ref::Make(Call(RuntimeShapes::api.bones,renderer),false);Require(ArrayLength(bones.Get(),&boneCount),"demand native Renderer bones absent");}
-    Identity source;bool hasSource=false;for(const auto& target:row.second.author->package.targetIndex){const auto& rule=row.second.author->package.rules.at(target.second);
-      if(std::find(rule.parts.begin(),rule.parts.end(),partId)!=rule.parts.end()){source=target.first;hasSource=true;break;}}
-    Require(hasSource,"native readback part has no source Mesh target");auto native=row.second.targets.find(source);Require(native!=row.second.targets.end(),"native readback source Mesh identity is absent");
     int sharedAcrossBundles=-1;size_t distinctBundles=0;{
       std::lock_guard<std::mutex> lock(mutex);auto key=std::make_tuple(record.scope,source.path,source.asset,partId);auto& observation=nativeMeshObservations[key];
       auto previous=observation.mesh.Get();if(!previous){observation.mesh=Ref::Make(mesh,true);observation.bundleInputs.clear();}
@@ -330,10 +332,20 @@ std::shared_ptr<Manifest> Current(void* object) {
   std::map<std::string,uint64_t> hintKeys;
   if(!hintNames.empty())try{hintKeys=StartupDependencies::ManifestKeys(object,StartupDependencies::State(object),hintNames,false);}
   catch(const std::exception& e){Log("[DEMAND-TARGET-ROUTE-GAP] scope=%llu reason=%s",state->serial,e.what());}
+  auto standaloneMeshTarget=[](const Identity& source){
+    if(source.path.size()>=5&&source.path.compare(source.path.size()-5,5,".mesh")==0)return true;
+    if(source.path.size()>=6&&source.path.compare(source.path.size()-6,6,".asset")==0&&!source.asset.empty()){
+      auto slash=source.path.find_last_of("/\\");
+      auto base=slash==std::string::npos?source.path:source.path.substr(slash+1);
+      auto stem=base.substr(0,base.size()-6);
+      return Q::Name(stem)==Q::Name(source.asset);
+    }
+    return false;
+  };
   for(size_t i=0;i<activeTargets.size();++i){const auto& source=activeTargets[i].source;Bytes info;bool exactLookup=false;
     const auto& hint=activeTargets[i].bundle;auto hinted=hintKeys.find(hint);
     const bool found=LookupTarget(object,source,info,exactLookup);
-    if(!found||(!exactLookup&&(source.path.size()<5||source.path.compare(source.path.size()-5,5,".mesh")!=0)))state->unresolved.push_back(i);
+    if(!found||(!exactLookup&&!standaloneMeshTarget(source)))state->unresolved.push_back(i);
     if(!found&&!hint.empty()&&hinted!=hintKeys.end()){
       // Some dependency-only Meshes have no standalone RuntimeManifest asset
       // entry. A logical Bundle route locates their current native input; the

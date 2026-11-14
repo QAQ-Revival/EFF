@@ -5,8 +5,10 @@
 > [!IMPORTANT]
 > Built upon upstream [ssice-a/EFF](https://github.com/ssice-a/EFF) `v2.0.12`, this fork fixes severe mesh distortion and reload failures when toggling or hot-reloading Mods in-game via `F10` (or custom `reload` hotkeys).
 
-## HotFix Changes (v2.0.12-hotfix.1)
+## HotFix Changes (v2.0.12-hotfix.2)
 
+- **Fix ~38s Scene-Loading Freeze**: Fixed standalone `.asset` Mesh targets (e.g. character LOD0 `.asset` assets) missing `EiemDemandLogicalAssetLookup` / `DemandLoadingProbe::Current()` stem matching and falsely accumulating in `state->unresolved`, which previously triggered repeated `SharedInputs` scans on every asset load; also replaced hot-path `IsBadReadPtr` / `IsBadWritePtr` calls with zero-exception canonical pointer checks and switched logging to 64KB buffered periodic flushes.
+- **Eliminate ~2s Team-Switch Character Stall**: `EiemNativeRandomAccess` now keeps immutable in-RAM snapshots for frozen author files (`<= 32 MB`) instead of writing synchronous `%TEMP%` snapshot files, pre-filters `pathId`/`classId` via `AssetsFiltered` before LZ4 block decompression, and caches `m_Container` indices; `EiemNativeSpliceView` coalesces adjacent uncompressed archive blocks to eliminate ~1,500 tiny `4B`/`16B` splice chunks.
 - **Fix `0 → 1` and `1 → 0 → 1` Hot-Reload Mesh Distortion**: Extended `DemandGenerationReload::Affected()` to match target vanilla source Mesh names (stripping `(Instance)` / `(Clone)` suffixes), ensuring already-instantiated world characters, UI preview models, and cached Prefabs properly rebuild and rebind skeletons when enabling a Mod after launching without Mods (`0 → 1`) or re-enabling after disabling (`1 → 0 → 1`).
 - **Fix Native `AssetBundle` (`CAB-*`) Collisions on Reload**: Drains idle reverse-dependent proxies in `BundleWaitUnloadState` and safely retires loaded native source `BundleProxy` / `AssetBundle` containers before submitting `versionedRoot` bundles, while unloading synthetic `CAB` identities on `1 → 0` passthrough loads.
 - **Compiler Portability**: Added dual MSVC and Clang / Zig C++ toolchain compatibility.
@@ -15,7 +17,7 @@
 
 AnimeStudio exports source assets and templates. Blender creates and compiles each independent Mod. EFF applies the compiled rules before the game creates resources and uses the game's model lifecycle for reloads.
 
-Paired releases: **EFF v2.0.12-hotfix.1, EFF Blender v0.50.7, EFF Mod Manager v0.2.3, AnimeStudio v1.9.5**. The DLL accepts Format 3 only; Mod Manager converts legacy packages offline.
+Paired releases: **EFF v2.0.12-hotfix.2, EFF Blender v0.50.7, EFF Mod Manager v0.2.3, AnimeStudio v1.9.5**. The DLL accepts Format 3 only; Mod Manager converts legacy packages offline.
 
 See the illustrated quick tutorial for installation, extraction, Blender editing and export: [English](Mod%20Tutorial_EN.md) · [中文](Mod%20Tutorial.md).
 
@@ -24,7 +26,7 @@ See the illustrated quick tutorial for installation, extraction, Blender editing
 Download from [EFF-HotFix Releases](https://github.com/BakaMai/EFF-HotFix/releases/latest) after quitting the game:
 
 - **Existing EFF Upgrade / EFMI Coexistence (Recommended)**: Download the standalone **`eff.dll`** and overwrite `plugin/eff.dll` beside `Endfield.exe`. This preserves your `plugin/eff.ini` hotkeys and will not overwrite EFMI or [EFF-EFMI-Compatibility-Plugin](https://github.com/BakaMai/EFF-EFMI-Compatibility-Plugin) proxy files.
-- **Fresh Standalone Install**: Download **`EFF_v2.0.12-hotfix.1_dll.zip`** and extract beside `Endfield.exe` (proxy forwarders currently support Windows installed at `C:\Windows`).
+- **Fresh Standalone Install**: Download **`EFF_v2.0.12-hotfix.2_dll.zip`** and extract beside `Endfield.exe` (proxy forwarders currently support Windows installed at `C:\Windows`).
 
 ```text
 d3dcompiler_47.dll

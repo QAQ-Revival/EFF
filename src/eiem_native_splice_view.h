@@ -58,10 +58,23 @@ inline Prepared BuildRanges(R::Reader& reader,const std::vector<Rewrite>& rewrit
   for(const auto& row:byMember){const auto& pieces=row.second->pieces;const auto& member=reader.directory.members[row.first];
     identity&=pieces.size()==1&&!pieces[0].bytes&&!pieces[0].view&&pieces[0].offset==0&&pieces[0].size==member.size;}
   if(identity)return BuildRanges(reader,{},literalBudget);
+  auto appendBlock=[&](size_t decoded,size_t encoded,uint16_t flags){
+    if(!flags){
+      for(size_t left=decoded;left;){
+        if(!result.blocks.empty()&&!result.blocks.back().flags&&result.blocks.back().decoded<size_t(UINT32_MAX)){
+          auto step=std::min(left,size_t(UINT32_MAX)-result.blocks.back().decoded);
+          result.blocks.back().decoded+=step;result.blocks.back().encoded+=step;left-=step;
+        }else{
+          auto step=std::min(left,size_t(UINT32_MAX));
+          result.blocks.push_back({step,step,0});left-=step;
+        }
+      }
+    }else result.blocks.push_back({decoded,encoded,flags});
+  };
   auto literal=[&](std::shared_ptr<const Bytes> bytes){if(bytes->empty())return;
     Require(result.literalBytes<=literalBudget&&bytes->size()<=literalBudget-result.literalBytes,"native splice literal budget exhausted");
     result.literalBytes+=bytes->size();result.decoded=AddSize(result.decoded,bytes->size());
-    result.blocks.push_back({bytes->size(),bytes->size(),0});result.spans.push_back({V::literalSource,0,bytes->size(),std::move(bytes)});
+    appendBlock(bytes->size(),bytes->size(),0);result.spans.push_back({V::literalSource,0,bytes->size(),std::move(bytes)});
   };
   std::map<const V::View*,size_t> authorIds;
   auto authored=[&](const Piece& piece){if(!piece.size)return;
@@ -70,7 +83,7 @@ inline Prepared BuildRanges(R::Reader& reader,const std::vector<Rewrite>& rewrit
     // Native block table widths are uint32. Split large ranges without an
     // artificial author-resource size limit or an allocation proportional to it.
     for(size_t at=piece.offset,left=piece.size;left;){auto n=std::min(left,size_t(UINT32_MAX));
-      result.blocks.push_back({n,n,0});result.spans.push_back({inserted.first->second,at,n,{}});
+      appendBlock(n,n,0);result.spans.push_back({inserted.first->second,at,n,{}});
       result.streamedAuthorBytes=AddSize(result.streamedAuthorBytes,n);result.decoded=AddSize(result.decoded,n);at+=n;left-=n;
     }
   };
@@ -82,7 +95,7 @@ inline Prepared BuildRanges(R::Reader& reader,const std::vector<Rewrite>& rewrit
     while(size){auto local=at-it->decodedOffset,n=std::min(size,it->block.decoded-local);Require(n,"native splice original block made no progress");
       if(!it->block.flags||(!local&&n==it->block.decoded)){
         auto encoded=it->block.flags?it->block.encoded:n;auto offset=AddSize(it->offset,it->block.flags?0:local);
-        result.blocks.push_back({n,encoded,it->block.flags});result.spans.push_back({0,offset,encoded,{}});result.reusedEncoded=AddSize(result.reusedEncoded,encoded);result.decoded=AddSize(result.decoded,n);
+        appendBlock(n,encoded,it->block.flags);result.spans.push_back({0,offset,encoded,{}});result.reusedEncoded=AddSize(result.reusedEncoded,encoded);result.decoded=AddSize(result.decoded,n);
       }else literal(std::make_shared<const Bytes>(reader.ReadAt(at,n,literalBudget-result.literalBytes)));
       at+=n;size-=n;++it;
     }

@@ -79,6 +79,15 @@ struct BoneWeight {
 struct Matrix4x4 { float m[16]; };
 struct Quaternion { float x, y, z, w; };
 
+inline bool ValidUserPointerRange(const void *p, size_t bytes) noexcept {
+  if (!p) return false;
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+  constexpr uintptr_t kMinUserAddr = 0x10000ULL;
+  constexpr uintptr_t kMaxUserAddr = 0x00007FFFFFFEFFFFULL;
+  return addr >= kMinUserAddr && addr <= kMaxUserAddr &&
+         bytes <= (kMaxUserAddr - addr) + 1ULL;
+}
+
 static int ReadStrUtf8(void *s, char *b, int sz) {
 #if defined(_MSC_VER) && !defined(__clang__)
   __try {
@@ -96,11 +105,11 @@ static int ReadStrUtf8(void *s, char *b, int sz) {
 #else
   if (!b || sz <= 0) return -2;
   if (!s) { b[0] = 0; return -1; }
-  if (IsBadReadPtr(s, 20)) { b[0] = 0; return -2; }
+  if (!ValidUserPointerRange(s, 20)) { b[0] = 0; return -2; }
   int32_t l = *(int32_t *)((char *)s + 16);
   if (l <= 0 || l > 2048) { b[0] = 0; return -1; }
   wchar_t *c = (wchar_t *)((char *)s + 20);
-  if (IsBadReadPtr(c, size_t(l) * sizeof(wchar_t))) { b[0] = 0; return -2; }
+  if (!ValidUserPointerRange(c, size_t(l) * sizeof(wchar_t))) { b[0] = 0; return -2; }
   int written = WideCharToMultiByte(CP_UTF8, 0, c, l, b, sz - 1, NULL, NULL);
   if (written < 0) written = 0;
   b[written] = 0;

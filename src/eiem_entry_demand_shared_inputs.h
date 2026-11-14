@@ -105,7 +105,7 @@ bool SharedInputByVfsHash(uint64_t hash,std::shared_ptr<SharedScope>& owner,Eiem
 }
 bool SharedInputByName(const std::string& name,std::shared_ptr<SharedScope>& owner,EiemDemandSharedGraph::Input& input){
   if(name.rfind("eff/",0)!=0)return false;const auto hash=SharedVfsHash(name);
-  return SharedInputByVfsHash(hash,owner,input)&&input.name==name;
+  return SharedInputByVfsHash(hash,owner,input)&&Q::Name(input.name)==name;
 }
 bool SharedSyntheticPath(void* path)noexcept{
   static constexpr wchar_t fullPrefix[]=L"data/bundles/windows/eff/";
@@ -124,13 +124,13 @@ bool SharedSyntheticPath(void* path)noexcept{
     return true;
   }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
 #else
-  if(!path||IsBadReadPtr(path,20))return false;
+  if(!ValidUserPointerRange(path,20))return false;
   auto length=*reinterpret_cast<const int32_t*>(static_cast<const char*>(path)+16);
   if(length<int32_t(bareCount))return false;
   auto chars=reinterpret_cast<const wchar_t*>(static_cast<const char*>(path)+20);
   const bool full=length>=int32_t(fullCount);
   const size_t checkCount=full?fullCount:bareCount;
-  if(IsBadReadPtr(chars,checkCount*sizeof(wchar_t)))return false;
+  if(!ValidUserPointerRange(chars,checkCount*sizeof(wchar_t)))return false;
   bool bare=true;
   for(size_t i=0;i<bareCount;++i){auto value=chars[i];if(value>=L'A'&&value<=L'Z')value+=L'a'-L'A';if(value!=barePrefix[i])bare=false;}
   if(bare)return true;if(!full)return false;
@@ -515,7 +515,7 @@ void* LoadSharedInput(void* path,void* info,bool asynchronous){
   auto name=Q::Name(String(path));const std::string prefix="data/bundles/windows/";
   auto at=name.find(prefix);if(at!=std::string::npos)name.erase(0,at+prefix.size());
   EiemDemandSharedGraph::Input input;std::shared_ptr<SharedScope> owner;bool matched=false;
-  if(sharedInputsEnabled&&activeSharedLoadRoute&&activeSharedLoadRoute->input.name==name){input=activeSharedLoadRoute->input;matched=true;}
+  if(sharedInputsEnabled&&activeSharedLoadRoute&&Q::Name(activeSharedLoadRoute->input.name)==name){input=activeSharedLoadRoute->input;matched=true;}
   if(sharedInputsEnabled&&!matched)matched=SharedInputByName(name,owner,input);
   if(!matched){if(name.find("eff/")!=std::string::npos){++sharedPathMissEvents;if(sharedPathMissEvents<=64)
       Log("[DEMAND-SHARED-PATH-MISS] path=%s async=%d graphNameLookup=0",name.c_str(),int(asynchronous));}
@@ -550,7 +550,7 @@ void ObserveTreeEntry(const char* method,void* manager,void* main)noexcept{
     if(proxyType&&!knownElsewhere){std::vector<std::shared_ptr<SharedScope>> active;
       {std::lock_guard<std::mutex> lock(mutex);for(const auto& row:sharedScopes)active.push_back(row.second);}
       for(const auto& scope:active)if(scope->graph.Find(key,input)){knownElsewhere=true;break;}}
-    if(!knownElsewhere)return;sequence=++sharedTreeRawObservations;if(sequence>96)return;
+    if(!knownElsewhere)return;sequence=++sharedTreeRawObservations;if(sequence>16)return;
     Log("[DEMAND-SHARED-TREE-RAW] method=%s call=%u main=%p type=%s.%s key=%016llX manifest=%p shared=%d graphKnown=%d name=%s",
       method,sequence,main,ns?ns:"?",type?type:"?",key,manifest,int(matched),int(knownElsewhere),input.name.c_str());
   }catch(const std::exception& e){Log("[DEMAND-SHARED-TREE-RAW-GAP] method=%s call=%u reason=%s",method,sequence,e.what());}
@@ -564,11 +564,15 @@ void* SharedGetOrCreate(void* manager,uint64_t hash,bool cancelRecycle,void* inf
     // Some game paths select a cached BundleProxy before querying dependencies.
     // A real request may also discover dependency-only targets whose logical
     // identity is absent from the public manifest. Negative groups are cached.
-    if(sharedRequestDepth&&manifest){auto state=Current(manifest);
-      auto verdict=CachedCandidate(state,hash);
-      if(state->bundles.count(hash)||verdict==Q::Candidate::Yes||verdict==Q::Candidate::Target||!state->unresolved.empty()){
-        auto prototype=StartupDependencies::NewListForManifest(manifest);
-        PrepareDependencyGroup(state,hash,prototype.Get());
+    if(sharedRequestDepth&&manifest){
+      EiemDemandSharedGraph::Input syntheticInput;
+      if(!SharedInput(manifest,hash,syntheticInput)){
+        auto state=Current(manifest);
+        auto verdict=CachedCandidate(state,hash);
+        if(state->bundles.count(hash)||verdict==Q::Candidate::Yes||verdict==Q::Candidate::Target||!state->unresolved.empty()){
+          auto prototype=StartupDependencies::NewListForManifest(manifest);
+          PrepareDependencyGroup(state,hash,prototype.Get());
+        }
       }
     }
   }catch(const std::exception& e){auto sequence=++sharedProxyObservations;if(sequence<=32)
@@ -657,12 +661,12 @@ void SharedOperationUpdate(void* manager,void* operation,void* info){
       if(proxy){il2cpp_field_get_value(proxy,sharedApi.proxyHashField,&hash);auto manifest=Call(StartupDependencies::api.managerManifest,manager);
         authored=SharedInput(manifest,hash,input);}}}
   catch(const std::exception& e){Log("[DEMAND-SHARED-OPERATION-GAP] phase=identify reason=%s",e.what());}
-  if(authored){auto sequence=++sharedOperationUpdateCalls;if(sequence<=96){
+  if(authored){auto sequence=++sharedOperationUpdateCalls;if(sequence<=16){
       Log("[DEMAND-SHARED-OPERATION] phase=before sequence=%llu operation=%p proxy=%p key=%016llX name=%s",
         (unsigned long long)sequence,operation,proxy,hash,input.name.c_str());
       LogSharedProxyState("operation-update","before",hash,input,proxy);}}
   performance.hit=authored;performance.Pause();originalSharedOperationUpdate(manager,operation,info);performance.Resume();
-  if(authored&&sharedOperationUpdateCalls.load()<=96){
+  if(authored&&sharedOperationUpdateCalls.load()<=16){
     LogSharedProxyState("operation-update","after",hash,input,proxy);
     Log("[DEMAND-SHARED-OPERATION] phase=after operation=%p proxy=%p key=%016llX name=%s",
       operation,proxy,hash,input.name.c_str());}
@@ -692,7 +696,7 @@ uint8_t SharedProxyLoadSync(void* proxy,void* info){
   uint64_t hash=0;EiemDemandSharedGraph::Input input;std::shared_ptr<SharedScope> owner;void* manifest=nullptr;
   if(!SharedProxyInput(proxy,hash,input,&owner,&manifest))return originalSharedProxyLoadSync(proxy,info);
   SharedLoadRouteScope route(manifest,owner,input);
-  auto sequence=++sharedProxyLoadObservations;const bool report=sequence<=96;
+  auto sequence=++sharedProxyLoadObservations;const bool report=sequence<=16;
   if(report)LogSharedProxyState("LoadSync","before",hash,input,proxy);
   CompleteSharedProxyImmediate(proxy,input);
   auto result=originalSharedProxyLoadSync(proxy,info);
@@ -704,7 +708,7 @@ uint8_t SharedProxyLoadAsync(void* proxy,void* info){
   uint64_t hash=0;EiemDemandSharedGraph::Input input;std::shared_ptr<SharedScope> owner;void* manifest=nullptr;
   if(!SharedProxyInput(proxy,hash,input,&owner,&manifest))return originalSharedProxyLoadAsync(proxy,info);
   SharedLoadRouteScope route(manifest,owner,input);
-  auto sequence=++sharedProxyLoadObservations;const bool report=sequence<=96;
+  auto sequence=++sharedProxyLoadObservations;const bool report=sequence<=16;
   if(report)LogSharedProxyState("LoadAsync","before",hash,input,proxy);
   auto result=originalSharedProxyLoadAsync(proxy,info);
   if(!result){
@@ -737,7 +741,7 @@ void SharedProxyUpdateLoading(void* proxy,void* info){
   uint64_t hash=0;EiemDemandSharedGraph::Input input;std::shared_ptr<SharedScope> owner;void* manifest=nullptr;
   if(!SharedProxyInput(proxy,hash,input,&owner,&manifest)){originalSharedProxyUpdateLoading(proxy,info);return;}
   SharedLoadRouteScope route(manifest,owner,input);
-  auto sequence=++sharedProxyPumpObservations;const bool report=sequence<=96;
+  auto sequence=++sharedProxyPumpObservations;const bool report=sequence<=16;
   if(report)LogSharedProxyState("UpdateLoading","before",hash,input,proxy);
   originalSharedProxyUpdateLoading(proxy,info);
   if(report)LogSharedProxyState("UpdateLoading","after",hash,input,proxy);
@@ -746,7 +750,7 @@ void SharedProxyLoadImmediate(void* proxy,void* info){
   uint64_t hash=0;EiemDemandSharedGraph::Input input;std::shared_ptr<SharedScope> owner;void* manifest=nullptr;
   if(!SharedProxyInput(proxy,hash,input,&owner,&manifest)){originalSharedProxyLoadImmediate(proxy,info);return;}
   SharedLoadRouteScope route(manifest,owner,input);
-  auto sequence=++sharedProxyLoadObservations;const bool report=sequence<=96;
+  auto sequence=++sharedProxyLoadObservations;const bool report=sequence<=16;
   if(report)LogSharedProxyState("_LoadImmediate","before",hash,input,proxy);
   if(!CompleteSharedProxyImmediate(proxy,input))originalSharedProxyLoadImmediate(proxy,info);
   MarkSharedProxyActive(owner,hash);
@@ -960,13 +964,13 @@ struct DependencyGroup {
     auto source=Open(bundle);Native(bundle);NativeReference resolved;size_t matches=0;
     for(const auto& member:source->reader->directory.members){if(!(member.flags&4))continue;
       auto layout=source->reader->Layout(member);auto hashes=source->reader->HashAssets(member,layout);auto selected=hashes.find(asset);
+      auto exact=source->reader->AssetsFiltered(member,layout,&identity.path,int(declaration.classId));
       if(selected!=hashes.end()&&selected->second.classId==int(declaration.classId)){
-        auto exact=source->reader->Assets(member,layout);
         auto exactIdentity=std::find_if(exact.begin(),exact.end(),[&](const auto& candidate){return candidate.pathId==selected->second.pathId&&
           candidate.classId==int(declaration.classId)&&candidate.path==identity.path&&candidate.asset==identity.asset;});
         if(exactIdentity!=exact.end()){resolved={exactIdentity->cab,exactIdentity->pathId};++matches;continue;}
       }
-      for(const auto& candidate:source->reader->Assets(member,layout))if(candidate.classId==int(declaration.classId)&&
+      for(const auto& candidate:exact)if(candidate.classId==int(declaration.classId)&&
           candidate.path==identity.path&&candidate.asset==identity.asset){resolved={candidate.cab,candidate.pathId};++matches;}
     }
     bool embedded=false;
@@ -1093,7 +1097,10 @@ bool PrepareDependencyGroup(const std::shared_ptr<Manifest>& manifest,uint64_t h
   // Includes lock acquisition and already-prepared lookups, which prepareMs
   // deliberately excludes. Native proxy/tree bodies are measured separately.
   EiemLoadPerformance::Scope performance(EiemLoadPerformance::DemandPrepare);
-  if(!sharedInputsEnabled)return false;auto shared=SharedFor(manifest);++shared->waitingPreparations;std::unique_lock<std::mutex> serial(shared->preparation);--shared->waitingPreparations;
+  if(!sharedInputsEnabled)return false;auto shared=SharedFor(manifest);
+  {EiemDemandSharedGraph::Input existingSynthetic;if(shared->graph.Find(hash,existingSynthetic))return false;}
+  ++shared->waitingPreparations;std::unique_lock<std::mutex> serial(shared->preparation);--shared->waitingPreparations;
+  {EiemDemandSharedGraph::Input existingSynthetic;if(shared->graph.Find(hash,existingSynthetic))return false;}
   shared->activeRoot=hash;shared->activeKey=hash;shared->activePhase="read-native-dependencies";shared->preparationStarted=GetTickCount64();shared->watchdogReported=0;shared->activePreparations=1;
   struct Activity {std::shared_ptr<SharedScope> scope;~Activity(){scope->activePreparations=0;scope->activePhase=nullptr;scope->activeRoot=0;scope->activeKey=0;scope->preparationStarted=0;}} activity{shared};
   auto prior=shared->preparedGroups.find(hash);if(prior!=shared->preparedGroups.end()&&registry.Get(prior->second).token)return true;
@@ -1105,19 +1112,27 @@ bool PrepareDependencyGroup(const std::shared_ptr<Manifest>& manifest,uint64_t h
   group.keys=native;group.keys.push_back(hash);
   auto routing=manifest;
   if(!manifest->unresolved.empty()){
-    // Request-local routing snapshots keep the published manifest immutable.
-    // Negative directory checks are cached once per native input/generation.
-    EiemDemandTargetLookup::Inspection targetInspection;
-    for(auto key:group.keys)if(!shared->targetDiscoveryChecked.count(key)){
-      try{auto source=group.Open(key);for(auto index:manifest->unresolved){const auto& target=manifest->catalog->targets.at(index);
-        auto resolve=[&](const NativeReference& reference,const Identity& identity,Asset& asset){auto location=group.DependencySource(reference.first);
-          return targetInspection.ReferencedMesh(*location.first->reader,reference,identity,asset);};
-        for(const auto& asset:targetInspection.Find(*source->reader,target.source,resolve)){
-          const auto carrier=group.cabs.at(asset.cab).first->key;
-          auto duplicate=std::find_if(shared->discoveredTargets.begin(),shared->discoveredTargets.end(),[&](const auto& row){return row.target==index&&row.bundle==carrier&&row.cab==asset.cab&&row.object==asset.pathId;});
-          if(duplicate==shared->discoveredTargets.end()){shared->discoveredTargets.push_back({index,carrier,0,asset.cab,asset.pathId});Log("[DEMAND-TARGET-DISCOVERED] mod=%s path=%s asset=%s bundle=%016llX requestLocal=1",target.mod.c_str(),target.source.path.c_str(),target.source.asset.c_str(),carrier);}
-        }}source->reader->DiscardDecodedCache();shared->targetDiscoveryChecked.insert(key);
-      }catch(const std::exception& error){Log("[DEMAND-TARGET-DISCOVERY-GAP] bundle=%016llX reason=%s originalInputPreserved=1",key,error.what());}
+    std::set<size_t> alreadyDiscovered;
+    for(const auto& binding:shared->discoveredTargets)alreadyDiscovered.insert(binding.target);
+    std::vector<size_t> pendingUnresolved;
+    for(auto index:manifest->unresolved)if(!alreadyDiscovered.count(index))pendingUnresolved.push_back(index);
+    if(!pendingUnresolved.empty()){
+      // Request-local routing snapshots keep the published manifest immutable.
+      // Negative directory checks are cached once per native input/generation.
+      EiemDemandTargetLookup::Inspection targetInspection;
+      for(auto key:group.keys)if(!shared->targetDiscoveryChecked.count(key)){
+        EiemDemandSharedGraph::Input syntheticKey;
+        if(shared->graph.Find(key,syntheticKey)){shared->targetDiscoveryChecked.insert(key);continue;}
+        try{auto source=group.Open(key);for(auto index:pendingUnresolved){const auto& target=manifest->catalog->targets.at(index);
+          auto resolve=[&](const NativeReference& reference,const Identity& identity,Asset& asset){auto location=group.DependencySource(reference.first);
+            return targetInspection.ReferencedMesh(*location.first->reader,reference,identity,asset);};
+          for(const auto& asset:targetInspection.Find(*source->reader,target.source,resolve)){
+            const auto carrier=group.cabs.at(asset.cab).first->key;
+            auto duplicate=std::find_if(shared->discoveredTargets.begin(),shared->discoveredTargets.end(),[&](const auto& row){return row.target==index&&row.bundle==carrier&&row.cab==asset.cab&&row.object==asset.pathId;});
+            if(duplicate==shared->discoveredTargets.end()){shared->discoveredTargets.push_back({index,carrier,0,asset.cab,asset.pathId});Log("[DEMAND-TARGET-DISCOVERED] mod=%s path=%s asset=%s bundle=%016llX requestLocal=1",target.mod.c_str(),target.source.path.c_str(),target.source.asset.c_str(),carrier);}
+          }}source->reader->DiscardDecodedCache();shared->targetDiscoveryChecked.insert(key);
+        }catch(const std::exception& error){shared->targetDiscoveryChecked.insert(key);Log("[DEMAND-TARGET-DISCOVERY-GAP] bundle=%016llX reason=%s originalInputPreserved=1",key,error.what());}
+      }
     }
     if(!shared->discoveredTargets.empty()){routing=std::make_shared<Manifest>();routing->object=manifest->object;routing->serial=manifest->serial;routing->catalog=manifest->catalog;routing->bindings=manifest->bindings;routing->bundles=manifest->bundles;
       std::set<size_t> discovered;for(const auto& binding:shared->discoveredTargets)discovered.insert(binding.target);
@@ -1173,10 +1188,14 @@ bool PrepareDependencyGroup(const std::shared_ptr<Manifest>& manifest,uint64_t h
     {std::lock_guard<std::mutex> lock(mutex);for(const auto& inspection:inspections)inspected.insert(inspection);}
     group.Stage("commit-shared-graph");
     std::map<uint64_t,uint64_t> stagedVfsRoutes;
-    for(const auto& input:group.inputs)for(auto vfsHash:{SharedVfsHash(input.name),SharedVfsPathHash(input.name)}){
-      Require(!manifest->bundles.count(vfsHash),"author VFS path hash collides with a native Bundle");
-      auto staged=stagedVfsRoutes.emplace(vfsHash,input.key);
-      Require(staged.second||staged.first->second==input.key,"author VFS path hash collision within dependency group");}
+    for(const auto& input:group.inputs){
+      const auto lowerName=Q::Name(input.name);
+      for(auto vfsHash:{SharedVfsHash(input.name),SharedVfsPathHash(input.name),SharedVfsHash(lowerName),SharedVfsPathHash(lowerName)}){
+        Require(!manifest->bundles.count(vfsHash),"author VFS path hash collides with a native Bundle");
+        auto staged=stagedVfsRoutes.emplace(vfsHash,input.key);
+        Require(staged.second||staged.first->second==input.key,"author VFS path hash collision within dependency group");
+      }
+    }
     std::map<uint64_t,SharedVfsRoute> stagedRouteIndex;
     for(const auto& row:stagedVfsRoutes)stagedRouteIndex.emplace(row.first,SharedVfsRoute{shared,row.second});
     std::unique_lock<std::mutex> routeLock(shared->vfsRouteMutex);
