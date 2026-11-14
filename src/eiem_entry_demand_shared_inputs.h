@@ -354,19 +354,23 @@ size_t RetireNativeSourceBundle(const EiemDemandSharedGraph::Input& input){
         Log("[NATIVE-SOURCE-BUNDLE-RETIRE-GAP] source=%016llX cab=%s reason=%s",input.categorySource,input.cab.c_str(),e.what());
       }
     }
-    const bool proxyUnloaded=tryUnloadIdleProxy(proxy);
-    auto remainingBundle=RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloaded,proxy)
-      ?nullptr:Call(StartupDependencies::api.proxyAssetBundle,proxy);
-    if(RuntimeShapes::Alive(remainingBundle)){
-      const int remainingRefs=RuntimeShapes::Scalar<int>(StartupDependencies::api.proxyGetRefCount,proxy);
-      NativeBundle::Unload(remainingBundle,false);
-      ++retired;
-      Log("[NATIVE-SOURCE-BUNDLE-RETIRE] source=%016llX cab=%s mode=container-unload-fallback refCount=%d retiredAncestors=%zu preserveLoadedObjects=1",
-        input.categorySource,input.cab.c_str(),remainingRefs,retiredAncestors);
-    }else if(proxyUnloaded||!RuntimeShapes::Alive(remainingBundle)){
-      ++retired;
-      Log("[NATIVE-SOURCE-BUNDLE-RETIRE] source=%016llX cab=%s mode=proxy-unload-sync retiredAncestors=%zu preserveLoadedObjects=1",
-        input.categorySource,input.cab.c_str(),retiredAncestors);
+    // A source bundle the game still holds stays loaded: unloading it under its proxy leaves the game
+    // a dead AssetBundle. The submit then meets the CAB collision as it did before this retirement.
+    // A failure here leaves the submit to go ahead, as it did before.
+    try{
+      const bool proxyUnloaded=tryUnloadIdleProxy(proxy);
+      auto remainingBundle=RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloaded,proxy)
+        ?nullptr:Call(StartupDependencies::api.proxyAssetBundle,proxy);
+      if(RuntimeShapes::Alive(remainingBundle)){
+        Log("[NATIVE-SOURCE-BUNDLE-RETIRE] source=%016llX cab=%s mode=kept-in-use refCount=%d retiredAncestors=%zu",
+          input.categorySource,input.cab.c_str(),RuntimeShapes::Scalar<int>(StartupDependencies::api.proxyGetRefCount,proxy),retiredAncestors);
+      }else if(proxyUnloaded||!RuntimeShapes::Alive(remainingBundle)){
+        ++retired;
+        Log("[NATIVE-SOURCE-BUNDLE-RETIRE] source=%016llX cab=%s mode=proxy-unload-sync retiredAncestors=%zu preserveLoadedObjects=1",
+          input.categorySource,input.cab.c_str(),retiredAncestors);
+      }
+    }catch(const std::exception& e){
+      Log("[NATIVE-SOURCE-BUNDLE-RETIRE-GAP] source=%016llX cab=%s reason=%s",input.categorySource,input.cab.c_str(),e.what());
     }
   }
   return retired;
