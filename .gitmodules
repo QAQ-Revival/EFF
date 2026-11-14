@@ -2,11 +2,14 @@
 	path = tools/AnimeStudio
 	url = https://github.com/ssice-a/AnimeStudio.git
 	branch = main
+	update = none
 [submodule "tools/Blender"]
 	path = tools/Blender
 	url = https://github.com/ssice-a/EFF-blender.git
 	branch = main
+	update = none
 [submodule "EFF-Mod-Manager"]
 	path = EFF-Mod-Manager
 	url = https://github.com/ssice-a/EFF-Mod-Manager.git
 	branch = main
+	update = none
