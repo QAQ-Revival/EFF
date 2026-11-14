@@ -41,8 +41,8 @@ inline bool SharedInputsPruned(const Artifact& artifact){
 inline Bytes Pack(const Bytes& plain){
  COMPRESSOR_HANDLE h=nullptr;Require(CreateCompressor(COMPRESS_ALGORITHM_XPRESS_HUFF,nullptr,&h)!=0,"compiled Mod compressor unavailable");
  struct Close{COMPRESSOR_HANDLE h;~Close(){CloseCompressor(h);}}close{h};SIZE_T n=0;
- Compress(h,plain.data(),plain.size(),nullptr,0,&n);Require(n&&GetLastError()==ERROR_INSUFFICIENT_BUFFER,"compiled Mod compression extent differs");
- Bytes packed(n);Require(Compress(h,plain.data(),plain.size(),packed.data(),packed.size(),&n)!=0,"compiled Mod compression failed");packed.resize(n);
+ Compress(h,const_cast<unsigned char*>(plain.data()),plain.size(),nullptr,0,&n);Require(n&&GetLastError()==ERROR_INSUFFICIENT_BUFFER,"compiled Mod compression extent differs");
+ Bytes packed(n);Require(Compress(h,const_cast<unsigned char*>(plain.data()),plain.size(),packed.data(),packed.size(),&n)!=0,"compiled Mod compression failed");packed.resize(n);
  Writer w;w.S(compressionStructure);w.N(plain.size());w.Blob(packed);auto hash=Sha(w.b.data(),w.b.size());w.Raw(hash.data(),hash.size());return w.b;
 }
 inline Bytes Unpack(const Bytes& bytes){

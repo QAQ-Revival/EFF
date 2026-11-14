@@ -110,10 +110,11 @@ bool SharedInputByName(const std::string& name,std::shared_ptr<SharedScope>& own
 bool SharedSyntheticPath(void* path)noexcept{
   static constexpr wchar_t fullPrefix[]=L"data/bundles/windows/eff/";
   static constexpr wchar_t barePrefix[]=L"eff/";
+  constexpr size_t fullCount=sizeof(fullPrefix)/sizeof(fullPrefix[0])-1;
+  constexpr size_t bareCount=sizeof(barePrefix)/sizeof(barePrefix[0])-1;
+#if defined(_MSC_VER) && !defined(__clang__)
   __try{
     if(!path)return false;auto length=*reinterpret_cast<const int32_t*>(static_cast<const char*>(path)+16);
-    constexpr size_t fullCount=sizeof(fullPrefix)/sizeof(fullPrefix[0])-1;
-    constexpr size_t bareCount=sizeof(barePrefix)/sizeof(barePrefix[0])-1;
     if(length<int32_t(bareCount))return false;
     auto chars=reinterpret_cast<const wchar_t*>(static_cast<const char*>(path)+20);
     bool full=length>=int32_t(fullCount),bare=true;
@@ -122,6 +123,20 @@ bool SharedSyntheticPath(void* path)noexcept{
     for(size_t i=0;i<fullCount;++i){auto value=chars[i];if(value>=L'A'&&value<=L'Z')value+=L'a'-L'A';if(value!=fullPrefix[i])return false;}
     return true;
   }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+#else
+  if(!path||IsBadReadPtr(path,20))return false;
+  auto length=*reinterpret_cast<const int32_t*>(static_cast<const char*>(path)+16);
+  if(length<int32_t(bareCount))return false;
+  auto chars=reinterpret_cast<const wchar_t*>(static_cast<const char*>(path)+20);
+  const bool full=length>=int32_t(fullCount);
+  const size_t checkCount=full?fullCount:bareCount;
+  if(IsBadReadPtr(chars,checkCount*sizeof(wchar_t)))return false;
+  bool bare=true;
+  for(size_t i=0;i<bareCount;++i){auto value=chars[i];if(value>=L'A'&&value<=L'Z')value+=L'a'-L'A';if(value!=barePrefix[i])bare=false;}
+  if(bare)return true;if(!full)return false;
+  for(size_t i=0;i<fullCount;++i){auto value=chars[i];if(value>=L'A'&&value<=L'Z')value+=L'a'-L'A';if(value!=fullPrefix[i])return false;}
+  return true;
+#endif
 }
 struct SharedApi {
   void *vfsInstance=nullptr,*vfsQuery=nullptr,*vfsPhysical=nullptr,*vfsEncrypted=nullptr;
@@ -134,7 +149,7 @@ struct SharedApi {
   void *proxyBundleFlag=nullptr,*proxyIsLoading=nullptr,*proxyIsSuccessToLoad=nullptr;
   void *proxyIsFailedToLoad=nullptr,*proxyHasErrorOrUnloaded=nullptr;
   void *proxyFinishWithBundle=nullptr;
-  void *managerTryGetBundleProxy=nullptr,*proxyReleaseBundleRef=nullptr;
+  void *managerTryGetBundleProxy=nullptr,*proxyReleaseBundleRef=nullptr,*reverseInfo=nullptr;
 } sharedApi;
 using SharedNameFn=void*(*)(void*,uint64_t,void*);
 using SharedIntFn=int32_t(*)(void*,uint64_t,void*);
@@ -248,13 +263,124 @@ uint64_t SharedVfsPathHash(const std::string& value){
 uint64_t SharedVfsHash(const std::string& name){
   return SharedVfsPathHash("Data/Bundles/Windows/"+name);
 }
+std::mutex cabByNativeVfsMutex;
+std::map<uint64_t,std::string> cabByNativeVfsHash;
+std::atomic<bool> hasNativeVfsCabAliases{false};
+void RememberNativeCabVfsRoutes(const EiemDemandSharedGraph::Input& input) noexcept {
+  if(!input.versionedRoot||input.cab.empty())return;
+  try{
+    const auto fullHash=SharedVfsHash(input.cab),bareHash=SharedVfsPathHash(input.cab);
+    std::lock_guard<std::mutex> lock(cabByNativeVfsMutex);
+    cabByNativeVfsHash[fullHash]=input.cab;
+    cabByNativeVfsHash[bareHash]=input.cab;
+    hasNativeVfsCabAliases.store(true,std::memory_order_release);
+  }catch(...){}
+}
+void RetireSyntheticCabForNativeVfs(uint64_t vfsHash) noexcept {
+  if(!hasNativeVfsCabAliases.load(std::memory_order_acquire))return;
+  try{
+    std::string cab;
+    {std::lock_guard<std::mutex> lock(cabByNativeVfsMutex);auto found=cabByNativeVfsHash.find(vfsHash);if(found!=cabByNativeVfsHash.end())cab=found->second;}
+    if(!cab.empty())NativeBundle::UnloadIdentity(cab);
+  }catch(...){}
+}
+size_t RetireNativeSourceBundle(const EiemDemandSharedGraph::Input& input){
+  if(!input.versionedRoot||!input.categorySource)return 0;
+  auto leases=StartupDependencies::ProxiesForBundle(input.categorySource);
+  if(leases.empty()&&sharedApi.managerTryGetBundleProxy){
+    void* routeManifest=activeSharedLoadRoute?activeSharedLoadRoute->manifest:nullptr;
+    auto managerRef=StartupDependencies::ManagerForManifest(routeManifest);
+    if(managerRef.Get()){
+      uint64_t key=input.categorySource;void* args[]={&key};
+      auto foundProxy=Call(sharedApi.managerTryGetBundleProxy,managerRef.Get(),args);
+      if(foundProxy){
+        auto manifest=routeManifest?routeManifest:Call(StartupDependencies::api.managerManifest,managerRef.Get());
+        if(manifest)leases.push_back({Ref::Make(foundProxy,false),Ref::Make(manifest,false),key});
+      }
+    }
+  }
+  if(leases.empty())return 0;
+  auto tryUnloadIdleProxy=[&](void* candidate)->bool{
+    if(!candidate)return false;
+    if(RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloaded,candidate))return false;
+    if(RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsLoading,candidate))return false;
+    if(RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloading,candidate))return false;
+    if(RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloadLocked,candidate))return false;
+    if(RuntimeShapes::Scalar<int>(StartupDependencies::api.proxyGetRefCount,candidate)!=0)return false;
+    unsigned char prevUnloadAll=0;
+    il2cpp_field_get_value(candidate,StartupDependencies::api.proxyUnloadAllLoadedObjects,&prevUnloadAll);
+    unsigned char preserveLoaded=0;
+    il2cpp_field_set_value(candidate,StartupDependencies::api.proxyUnloadAllLoadedObjects,&preserveLoaded);
+    try{Call(StartupDependencies::api.proxyUnloadSync,candidate);}
+    catch(...){il2cpp_field_set_value(candidate,StartupDependencies::api.proxyUnloadAllLoadedObjects,&prevUnloadAll);throw;}
+    il2cpp_field_set_value(candidate,StartupDependencies::api.proxyUnloadAllLoadedObjects,&prevUnloadAll);
+    return RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloaded,candidate)!=0;
+  };
+  size_t retired=0;
+  for(const auto& lease:leases){
+    auto proxy=lease.proxy.Get();if(!proxy)continue;
+    if(RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloaded,proxy))continue;
+    auto bundle=Call(StartupDependencies::api.proxyAssetBundle,proxy);
+    if(!RuntimeShapes::Alive(bundle))continue;
+    size_t retiredAncestors=0;
+    if(RuntimeShapes::Scalar<int>(StartupDependencies::api.proxyGetRefCount,proxy)>0){
+      try{
+        void* manager=nullptr;il2cpp_field_get_value(proxy,StartupDependencies::api.proxyManagerField,&manager);
+        void* manifest=lease.manifest.Get();
+        if(!manifest&&manager)manifest=Call(StartupDependencies::api.managerManifest,manager);
+        if(manager&&manifest&&originalSharedReverse&&sharedApi.reverseInfo&&sharedApi.managerTryGetBundleProxy){
+          std::vector<uint64_t> queue{input.categorySource};
+          std::set<uint64_t> visited{input.categorySource};
+          std::vector<Ref> ancestorProxies;
+          for(size_t qi=0;qi<queue.size()&&visited.size()<64;++qi){
+            auto scratch=StartupDependencies::NewListForManifest(manifest);
+            originalSharedReverse(manifest,queue[qi],scratch.Get(),sharedApi.reverseInfo);
+            for(auto revKey:StartupDependencies::ReadList(scratch.Get())){
+              if(!visited.insert(revKey).second)continue;
+              void* args[]={&revKey};
+              auto revProxy=Call(sharedApi.managerTryGetBundleProxy,manager,args);
+              if(!revProxy||RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloaded,revProxy))continue;
+              ancestorProxies.push_back(Ref::Make(revProxy,false));
+              queue.push_back(revKey);
+            }
+          }
+          bool progressed=true;
+          while(progressed){
+            progressed=false;
+            for(const auto& anc:ancestorProxies)if(tryUnloadIdleProxy(anc.Get())){++retiredAncestors;progressed=true;}
+          }
+        }
+      }catch(const std::exception& e){
+        Log("[NATIVE-SOURCE-BUNDLE-RETIRE-GAP] source=%016llX cab=%s reason=%s",input.categorySource,input.cab.c_str(),e.what());
+      }
+    }
+    const bool proxyUnloaded=tryUnloadIdleProxy(proxy);
+    auto remainingBundle=RuntimeShapes::Scalar<uint8_t>(StartupDependencies::api.proxyIsUnloaded,proxy)
+      ?nullptr:Call(StartupDependencies::api.proxyAssetBundle,proxy);
+    if(RuntimeShapes::Alive(remainingBundle)){
+      const int remainingRefs=RuntimeShapes::Scalar<int>(StartupDependencies::api.proxyGetRefCount,proxy);
+      NativeBundle::Unload(remainingBundle,false);
+      ++retired;
+      Log("[NATIVE-SOURCE-BUNDLE-RETIRE] source=%016llX cab=%s mode=container-unload-fallback refCount=%d retiredAncestors=%zu preserveLoadedObjects=1",
+        input.categorySource,input.cab.c_str(),remainingRefs,retiredAncestors);
+    }else if(proxyUnloaded||!RuntimeShapes::Alive(remainingBundle)){
+      ++retired;
+      Log("[NATIVE-SOURCE-BUNDLE-RETIRE] source=%016llX cab=%s mode=proxy-unload-sync retiredAncestors=%zu preserveLoadedObjects=1",
+        input.categorySource,input.cab.c_str(),retiredAncestors);
+    }
+  }
+  return retired;
+}
 size_t RetirePreviousSharedInput(const EiemDemandSharedGraph::Input& input){
   Require(!input.cab.empty(),"shared native input source CAB identity absent");
-  return NativeBundle::UnloadIdentity(input.cab);
+  size_t retired=NativeBundle::UnloadIdentity(input.cab);
+  retired+=RetireNativeSourceBundle(input);
+  return retired;
 }
 void* SubmitSharedInput(const EiemDemandSharedGraph::Input& input,uint32_t crc,bool asynchronous,const char* boundary){
   auto started=std::chrono::steady_clock::now();if(asynchronous)++sharedPendingLoads;
   try{const auto retired=RetirePreviousSharedInput(input);
+    RememberNativeCabVfsRoutes(input);
     auto completed=[key=input.key,cab=input.cab,started,asynchronous,boundary=std::string(boundary)](void* bundle){
       if(asynchronous)--sharedPendingLoads;++sharedLoadCompletions;if(!bundle)++sharedLoadFailures;
       Log("[DEMAND-SHARED-COMPLETE] route=%s key=%016llX cab=%s async=%d bundle=%p elapsedMs=%.3f",
@@ -276,8 +402,8 @@ bool SharedVfsLoad(uint64_t vfsHash,uint32_t crc,bool asynchronous,void*& result
         if(found!=activeSharedLoadRoute->shared->vfsRoutes.end())route=found->second;}
       if(route==activeSharedLoadRoute->input.key){shared=activeSharedLoadRoute->shared;input=activeSharedLoadRoute->input;}
     }
-    if(!shared&&!SharedInputByVfsHash(vfsHash,shared,input))return false;
-    if(!input.view)return false;
+    if(!shared&&!SharedInputByVfsHash(vfsHash,shared,input)){RetireSyntheticCabForNativeVfs(vfsHash);return false;}
+    if(!input.view){RetireSyntheticCabForNativeVfs(vfsHash);return false;}
     ++sharedVfsRouteMatches;auto sequence=sharedVfsRouteMatches.load();if(sequence<=64)
       Log("[DEMAND-SHARED-VFS-ROUTE] hash=%016llX key=%016llX name=%s async=%d crc=%u inputBytes=%zu gameBundleProxy=1",
         vfsHash,input.key,input.name.c_str(),int(asynchronous),crc,input.view->Size());
@@ -393,9 +519,11 @@ void* LoadSharedInput(void* path,void* info,bool asynchronous){
   if(sharedInputsEnabled&&!matched)matched=SharedInputByName(name,owner,input);
   if(!matched){if(name.find("eff/")!=std::string::npos){++sharedPathMissEvents;if(sharedPathMissEvents<=64)
       Log("[DEMAND-SHARED-PATH-MISS] path=%s async=%d graphNameLookup=0",name.c_str(),int(asynchronous));}
+    else if(!name.empty())NativeBundle::UnloadIdentity(name);
     return (asynchronous?originalSharedLoadAsync:originalSharedLoad)(path,info);}
   ++sharedLoadMatches;
-  if(!input.view)return (asynchronous?originalSharedLoadAsync:originalSharedLoad)(path,info);
+  if(!input.view){if(!name.empty()&&name.rfind("eff/",0)!=0)NativeBundle::UnloadIdentity(name);
+    return (asynchronous?originalSharedLoadAsync:originalSharedLoad)(path,info);}
   // The original BundleProxy receives an actual Unity request. Its own status,
   // cancellation, retry, reference counts and unload path remain authoritative.
   return SubmitSharedInput(input,0,asynchronous,"proxy-file");
@@ -1180,6 +1308,8 @@ void InstallSharedInputs(void** assemblies,size_t count){
   hook(manifest,"GetBundleNameString",{scalar.c_str()},"System.String",false,(void*)SharedName,(void**)&originalSharedName);
   hook(manifest,"GetBundleNameUnSafeString",{scalar.c_str()},"Beyond.UnSafeString",false,(void*)SharedUnsafe,(void**)&originalSharedUnsafe);
   auto listName=StartupDependencies::TypeName(il2cpp_method_get_param(StartupDependencies::api.allInfo,1));
+  sharedApi.reverseInfo=Exact(manifest,"TryGetBundleReverseDeps",{scalar.c_str(),listName.c_str()},"System.Boolean",false);
+  Require(sharedApi.reverseInfo,"shared native reverse dependency method info absent");
   hook(manifest,"TryGetBundleReverseDeps",{scalar.c_str(),listName.c_str()},"System.Boolean",false,(void*)SharedReverse,(void**)&originalSharedReverse);
   hook(vfs,"GetFileInfo",{"System.String",infoTypeName.c_str()},"System.Boolean",false,(void*)SharedVfsGetFileInfo,(void**)&originalSharedVfsQuery);
   hook(proxy,"_LoadAssetBundle",{"System.String"},"UnityEngine.AssetBundle",true,(void*)SharedLoad,(void**)&originalSharedLoad);

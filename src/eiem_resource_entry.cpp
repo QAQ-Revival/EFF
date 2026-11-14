@@ -326,12 +326,21 @@ std::atomic<unsigned> captures{0};
 bool CopyRaw(const void *input, void *output, size_t bytes) {
   if (!input || !output || uintptr_t(input) > UINTPTR_MAX - bytes)
     return false;
+  if (!bytes)
+    return true;
+#if defined(_MSC_VER) && !defined(__clang__)
   __try {
     memcpy(output, input, bytes);
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+#else
+  if (IsBadReadPtr(input, bytes) || IsBadWritePtr(output, bytes))
+    return false;
+  memcpy(output, input, bytes);
+  return true;
+#endif
 }
 bool ArrayLength(void *array, size_t *length) {
   uint64_t n = 0;

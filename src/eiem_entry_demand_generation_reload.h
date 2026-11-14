@@ -61,16 +61,34 @@ size_t RetireOwnerBindings(const Owner& owner) {
   return retired;
 }
 
+inline std::string StripUnityMeshSuffix(std::string value) {
+  for(const char* suffix:{" (Instance)","(Instance)"," (Clone)","(Clone)"}) {
+    const auto len=std::strlen(suffix);
+    if(value.size()>len&&value.compare(value.size()-len,len,suffix)==0) {
+      value.erase(value.size()-len);
+      break;
+    }
+  }
+  return value;
+}
+
 bool Affected(void* root,const DemandLoadingProbe::InstalledGeneration& next) {
   if(!next.delta.changed)return false;
   if(!RuntimeShapes::Alive(root))return true;
-  std::set<std::string> changedParts;
-  for(const auto& target:next.targets)if(next.delta.packages.count(target.mod)&&!next.delta.controlOnlyPackages.count(target.mod))
+  std::set<std::string> changedParts,changedTargetAssets;
+  for(const auto& target:next.delta.targets)if(!target.second.empty())changedTargetAssets.insert(target.second);
+  for(const auto& target:next.targets)if(next.delta.packages.count(target.mod)&&!next.delta.controlOnlyPackages.count(target.mod)){
     changedParts.insert(target.partIds.begin(),target.partIds.end());
+    if(!target.source.asset.empty())changedTargetAssets.insert(target.source.asset);
+  }
   for(const auto& renderer:FullResourceReload::Components(root)) {
     auto mesh=RuntimeShapes::SourceMesh(renderer.Get());
     auto spec=RuntimeShapes::Match(renderer.Get(),mesh);
     if(spec&&next.delta.packages.count(spec->package)&&!next.delta.controlOnlyPackages.count(spec->package))return true;
+    if(mesh&&!changedTargetAssets.empty()&&RuntimeShapes::Alive(mesh)) {
+      auto meshName=String(RuntimeShapes::Call(RuntimeShapes::api.name,mesh));
+      if(changedTargetAssets.count(meshName)||changedTargetAssets.count(StripUnityMeshSuffix(meshName)))return true;
+    }
     if(changedParts.empty()||!RuntimeShapes::api.rendererGameObject)continue;
     auto gameObject=Ref::Make(RuntimeShapes::Call(RuntimeShapes::api.rendererGameObject,renderer.Get()),false);
     if(!RuntimeShapes::Alive(gameObject.Get()))continue;

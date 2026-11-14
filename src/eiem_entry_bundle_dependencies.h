@@ -193,6 +193,15 @@ std::vector<BundleProxyLease> ProxiesForBundle(uint64_t hash){
   if(proxy&&manifest)result.push_back({Ref::Make(proxy,false),Ref::Make(manifest,false),hash});}
  return result;
 }
+Ref ManagerForManifest(void* targetManifest){
+ std::vector<Ref> candidates;
+ {std::lock_guard<std::mutex> lock(mutex);
+  for(const auto& row:snapshots){auto proxy=row.second.proxy.Get(),manifest=row.second.manifest.Get();
+   if(proxy&&(!targetManifest||manifest==targetManifest)){candidates.push_back(Ref::Make(proxy,false));break;}}}
+ for(const auto& proxy:candidates){void* manager=nullptr;il2cpp_field_get_value(proxy.Get(),api.proxyManagerField,&manager);
+  if(manager)return Ref::Make(manager,false);}
+ return {};
+}
 void Init(void* self,uint64_t hash,void* manager,void* info){
 #if defined(EIEM_DEMAND_LOADING_PROBE)
  if(enabled)try{auto manifest=Call(api.managerManifest,manager);if(manifest)DemandLoadingProbe::BundleRequest(manifest,hash,"proxy-init-enter");}catch(const std::exception& e){Log("[DEMAND-PROBE-GAP] phase=proxy-init reason=%s",e.what());}

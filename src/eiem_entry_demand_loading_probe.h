@@ -210,8 +210,9 @@ bool SubmitPrepared(uint64_t token,uint32_t crc,bool asynchronous,void*& result)
   // Reuse the loader's retained seekable stream. Its cursor owns the view,
   // and the view callback owns the source handle beyond async completion.
   Require(!crc,"demand native acceptance caller CRC differs");struct Guard{bool previous;Guard():previous(submittingView){submittingView=true;}~Guard(){submittingView=previous;}} guard;
+  const auto identity=Q::Name(registry.Get(token).name);if(!identity.empty())NativeBundle::UnloadIdentity(identity);
   LogTiming(token,"native-view-submit-enter",0.0,asynchronous?"async=1":"async=0");auto nativeBegin=std::chrono::steady_clock::now();
-  result=NativeBundle::LoadView(view,0,asynchronous);LogTiming(token,"native-view-submit-return",ElapsedMs(nativeBegin),asynchronous?"async=1":"async=0");++replacementSubmissions;
+  result=NativeBundle::LoadView(view,0,asynchronous,{},identity);LogTiming(token,"native-view-submit-return",ElapsedMs(nativeBegin),asynchronous?"async=1":"async=0");++replacementSubmissions;
   Log("[DEMAND-NATIVE-SUBMIT] token=%llu async=%d nativeResult=%p viewBytes=%zu nativeDeserializerOwnsCreation=1",token,int(asynchronous),result,view->Size());return true;
 }
 void VerifyAsset(uint64_t token,void* object){
@@ -643,7 +644,7 @@ void* FileResult(void* path,uint32_t crc,uint64_t offset,bool asynchronous){auto
   try{handled=SubmitPrepared(token,crc,asynchronous,result);if(handled&&!result){handled=false;Log("[DEMAND-NATIVE-FALLBACK] token=%llu reason=replacement-loader-returned-null originalInputPreserved=1",token);}}
   catch(const std::exception& e){handled=false;result=nullptr;++gaps;Log("[DEMAND-NATIVE-FALLBACK] token=%llu reason=%s originalInputPreserved=1",token,e.what());}
 #endif
-  if(!handled){if(timed)LogTiming(token,"native-file-call-enter",0.0,asynchronous?"async=1 passthrough=1":"async=0 passthrough=1");auto nativeBegin=std::chrono::steady_clock::now();result=(asynchronous?nativeFileAsync:nativeFile)(path,crc,offset);if(timed)LogTiming(token,"native-file-call-return",ElapsedMs(nativeBegin),asynchronous?"async=1 passthrough=1":"async=0 passthrough=1");}
+  if(!handled){if(record.token&&!record.name.empty())NativeBundle::UnloadIdentity(Q::Name(record.name));if(timed)LogTiming(token,"native-file-call-enter",0.0,asynchronous?"async=1 passthrough=1":"async=0 passthrough=1");auto nativeBegin=std::chrono::steady_clock::now();result=(asynchronous?nativeFileAsync:nativeFile)(path,crc,offset);if(timed)LogTiming(token,"native-file-call-return",ElapsedMs(nativeBegin),asynchronous?"async=1 passthrough=1":"async=0 passthrough=1");}
   if(timed)LogTiming(token,"file-route-return",ElapsedMs(routeBegin),handled?"replacement=1":"replacement=0");Submitted(token,result,asynchronous);return result;
 }
 void* NativeFile(void* path,uint32_t crc,uint64_t offset){return FileResult(path,crc,offset,false);}
