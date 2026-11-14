@@ -148,6 +148,8 @@ FILE *OpenLog(const std::filesystem::path &path, bool exclusive = false) {
   auto file = _fdopen(descriptor, "wb");
   if (!file)
     _close(descriptor);
+  else
+    setvbuf(file, nullptr, _IOFBF, 64 * 1024);
   return file;
 }
 struct ManagedAttachment {
@@ -175,6 +177,18 @@ struct ManagedAttachment {
 std::mutex logMutex;
 FILE *logFile = nullptr;
 FILE *logMirror = nullptr;
+ULONGLONG lastLogFlushTick = 0;
+bool logDirty = false;
+void FlushLogs() {
+  std::lock_guard<std::mutex> lock(logMutex);
+  if (!logDirty)
+    return;
+  for (auto output : {logFile, logMirror})
+    if (output)
+      fflush(output);
+  lastLogFlushTick = GetTickCount64();
+  logDirty = false;
+}
 std::filesystem::path gameDirectory, sessionDirectory;
 std::atomic_bool active{true}, reload{false};
 std::atomic<uint64_t> reloadClock{0};
@@ -326,12 +340,21 @@ std::atomic<unsigned> captures{0};
 bool CopyRaw(const void *input, void *output, size_t bytes) {
   if (!input || !output || uintptr_t(input) > UINTPTR_MAX - bytes)
     return false;
+  if (!bytes)
+    return true;
+#if defined(_MSC_VER) && !defined(__clang__)
   __try {
     memcpy(output, input, bytes);
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
+#else
+  if (!ValidUserPointerRange(input, bytes) || !ValidUserPointerRange(output, bytes))
+    return false;
+  memcpy(output, input, bytes);
+  return true;
+#endif
 }
 bool ArrayLength(void *array, size_t *length) {
   uint64_t n = 0;
@@ -1690,6 +1713,7 @@ DWORD StartImpl() {
     RuntimeControls::preferences.Flush(Log);
     EiemLoadPerformance::Flush();
     RuntimeControls::keySettings.Flush(Log);
+    FlushLogs();
     Sleep(25);
   }
 }
@@ -1722,13 +1746,29 @@ void Log(const char *format, ...) {
   if (Entry::logFile) {
     SYSTEMTIME now;
     GetLocalTime(&now);
+    const ULONGLONG tick = GetTickCount64();
+    const bool flushNow =
+        (tick - Entry::lastLogFlushTick >= 200) ||
+        !strncmp(line, "[BUILD]", 7) || !strncmp(line, "[ENTRY", 6) ||
+        strstr(line, "FATAL") != nullptr || strstr(line, "ERROR") != nullptr ||
+        strstr(line, "REJECT") != nullptr || strstr(line, "GAP]") != nullptr ||
+        strstr(line, "FAILED]") != nullptr || strstr(line, "READY]") != nullptr ||
+        strstr(line, "COMMIT") != nullptr || strstr(line, "RELOAD") != nullptr ||
+        strstr(line, "STATS]") != nullptr;
     for (auto output : {Entry::logFile, Entry::logMirror}) {
       if (!output)
         continue;
       fprintf(output, "[%02u:%02u:%02u.%03u] [pid=%lu tid=%lu] %s\n", now.wHour,
               now.wMinute, now.wSecond, now.wMilliseconds,
               GetCurrentProcessId(), GetCurrentThreadId(), line);
-      fflush(output);
+      if (flushNow)
+        fflush(output);
+    }
+    if (flushNow) {
+      Entry::lastLogFlushTick = tick;
+      Entry::logDirty = false;
+    } else {
+      Entry::logDirty = true;
     }
   }
 }

@@ -31,6 +31,8 @@ class File {
   size_t available_ = 0;
   BY_HANDLE_FILE_INFORMATION stamp_{};
   std::mutex mutex_;
+  std::shared_ptr<const Bytes> memory_;
+  std::atomic<const Bytes*> memoryPtr_{nullptr};
   bool frozen_ = false;
 public:
   File(const std::filesystem::path& path, uint64_t offset, bool immutableAuthor = false) : offset_(offset) {
@@ -52,8 +54,7 @@ public:
   size_t Size() const { return available_; }
   // A retained handle survives rename/delete, but does not isolate in-place
   // writes. Only actual author payload demands freeze their backing bytes.
-  // Metadata-only catalog reads and original game ranges stay lazy. The copy
-  // uses bounded scratch memory and is deleted by Windows on close/crash.
+  // Metadata-only catalog reads and original game ranges stay lazy.
   void Freeze() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (frozen_) return;
@@ -68,6 +69,23 @@ public:
                              FILE_FLAG_SEQUENTIAL_SCAN);
     Require(held.source != INVALID_HANDLE_VALUE, "author resource is being written; retry loading after replacement completes");
     VerifyStable();
+    if (available_ <= 32 * 1024 * 1024) {
+      LARGE_INTEGER position{}; position.QuadPart = LONGLONG(offset_);
+      Require(SetFilePointerEx(held.source, position, nullptr, FILE_BEGIN), "author snapshot source seek failed");
+      auto snapshot = std::make_shared<Bytes>(available_);
+      for (size_t at = 0; at < available_;) {
+        auto count = DWORD(std::min(available_ - at, size_t(1024 * 1024))); DWORD read = 0;
+        Require(ReadFile(held.source, snapshot->data() + at, count, &read, nullptr) && read == count,
+                "author snapshot source read truncated");
+        at += count;
+      }
+      VerifyStable();
+      CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE;
+      offset_ = 0; memory_ = std::move(snapshot);
+      memoryPtr_.store(memory_.get(), std::memory_order_release);
+      frozen_ = true;
+      return;
+    }
     wchar_t temporary[MAX_PATH + 1]{};
     auto length = GetTempPathW(MAX_PATH + 1, temporary);
     Require(length && length <= MAX_PATH, "author snapshot temporary path unavailable");
@@ -101,7 +119,16 @@ public:
   size_t SnapshotBytes() const { return frozen_ ? available_ : 0; }
   void ReadAt(size_t at, unsigned char* output, size_t size) {
     Require(at <= available_ && size <= available_ - at, "native file read exceeds observed range");
+    if (!size) return;
+    if (const auto* mem = memoryPtr_.load(std::memory_order_acquire)) {
+      std::memcpy(output, mem->data() + at, size);
+      return;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
+    if (memory_) {
+      std::memcpy(output, memory_->data() + at, size);
+      return;
+    }
     LARGE_INTEGER position{}; position.QuadPart = LONGLONG(offset_ + at);
     Require(SetFilePointerEx(handle_, position, nullptr, FILE_BEGIN), "native range seek failed");
     for (size_t p = 0; p < size;) {
@@ -111,6 +138,7 @@ public:
     }
   }
   void VerifyStable() const {
+    if (memoryPtr_.load(std::memory_order_acquire)) return;
     BY_HANDLE_FILE_INFORMATION now{};
     Require(GetFileInformationByHandle(handle_, &now) &&
         now.nFileSizeHigh == stamp_.nFileSizeHigh && now.nFileSizeLow == stamp_.nFileSizeLow &&
@@ -360,29 +388,38 @@ public:
     for(auto child:type.nodes.at(0).children){auto found=values.find(type.nodes.at(child).name);if(found!=values.end())result.children.push_back(std::move(found->second));}
     return result;
   }
-  std::vector<Asset> Assets(const EiemNativeViewWriter::Member& member, const SerializedLayout& layout) {
+  std::vector<Asset> AssetsFiltered(const EiemNativeViewWriter::Member& member, const SerializedLayout& layout,
+      const std::string* filterPath = nullptr, int filterClassId = 0) {
     std::vector<Asset> result;
     for (auto id : layout.order) {
       const auto& type = layout.types.at(layout.objects.at(id).type); if (type.classId != 142) continue;
       auto fields = Fields(member,layout,id,{"m_Container"});
       for (const auto& row : ArrayValue(type,fields.at("m_Container")).children) {
-        const auto& key=Child(type,row,"first"); const auto& info=Child(type,row,"second");
-        const auto& ptr=Child(type,info,"asset"); auto file=Integer(Child(type,ptr,"m_FileID"));
-        Require(file<=layout.externals.size(),"native container external index differs");
+        const auto& key=Child(type,row,"first");
         Asset asset; asset.path=Text(key.raw.data(),key.raw.size());
         std::transform(asset.path.begin(),asset.path.end(),asset.path.begin(),[](unsigned char c){return char(std::tolower(c));});
+        if (filterPath && asset.path != *filterPath) continue;
+        const auto& info=Child(type,row,"second");
+        const auto& ptr=Child(type,info,"asset"); auto file=Integer(Child(type,ptr,"m_FileID"));
+        Require(file<=layout.externals.size(),"native container external index differs");
         asset.cab=file?layout.externals[size_t(file)-1]:member.name;
         asset.pathId=int64_t(Integer(Child(type,ptr,"m_PathID")));
         auto target=layout.objects.find(asset.pathId);
         if (!file && target!=layout.objects.end()) { const auto& t=layout.types.at(target->second.type); asset.classId=t.classId; asset.type=t.hash;
+          if (filterClassId && asset.classId != filterClassId) continue;
           if (std::any_of(t.nodes[0].children.begin(),t.nodes[0].children.end(),[&](size_t n){return t.nodes[n].name=="m_Name";})) {
             auto name=Fields(member,layout,asset.pathId,{"m_Name"}); const auto& v=name.at("m_Name"); asset.asset=Text(v.raw.data(),v.raw.size());
           }
+        } else if (filterClassId) {
+          continue;
         }
         result.push_back(std::move(asset));
       }
     }
     return result;
+  }
+  std::vector<Asset> Assets(const EiemNativeViewWriter::Member& member, const SerializedLayout& layout) {
+    return AssetsFiltered(member, layout, nullptr, 0);
   }
   // A prefab's embedded objects need not have their own container entries.
   // Only expose references owned by the exact requested container's native

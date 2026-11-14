@@ -26,6 +26,7 @@ std::map<void*,MemoryRequest> memoryRequests;
 std::map<void*,MemoryBundle> memoryBundles;
 std::map<void*,MemoryUnload> memoryUnloads;
 std::atomic<bool> memoryWork{false};
+std::atomic<size_t> memoryBundleCount{0};
 using UnloadFn=void(*)(void*,bool);
 using UnloadAsyncFn=void*(*)(void*,bool);
 UnloadFn originalUnload=nullptr;
@@ -61,18 +62,19 @@ void StreamLength(void* stream,void* result,void* info){
  int64_t length=view->Length();if(result)std::memcpy(result,&length,sizeof(length));
 }
 std::shared_ptr<uint32_t> MemoryIdentity(void* bundle){
+ if(!memoryBundleCount.load(std::memory_order_acquire))return {};
  std::lock_guard<std::mutex> lock(memoryMutex);auto found=memoryBundles.find(bundle);
  return found==memoryBundles.end()?std::shared_ptr<uint32_t>{}:found->second.bundle.handle;
 }
 void ReleasedMemory(void* bundle,const std::shared_ptr<uint32_t>& identity){
  if(!identity)return;std::lock_guard<std::mutex> lock(memoryMutex);auto found=memoryBundles.find(bundle);
- if(found!=memoryBundles.end()&&found->second.bundle.handle==identity)memoryBundles.erase(found);
+ if(found!=memoryBundles.end()&&found->second.bundle.handle==identity){memoryBundles.erase(found);memoryBundleCount.store(memoryBundles.size(),std::memory_order_release);}
 }
 void Unload(void* bundle,bool destroy){
  auto identity=MemoryIdentity(bundle);originalUnload(bundle,destroy);ReleasedMemory(bundle,identity);
 }
 size_t UnloadIdentity(const std::string& fileIdentity){
- if(fileIdentity.empty())return 0;std::vector<void*> bundles;
+ if(fileIdentity.empty()||!memoryBundleCount.load(std::memory_order_acquire))return 0;std::vector<void*> bundles;
  {std::lock_guard<std::mutex> lock(memoryMutex);for(const auto& row:memoryBundles)
    if(row.second.fileIdentity==fileIdentity)bundles.push_back(row.first);}
  for(auto bundle:bundles)Unload(bundle,false);
@@ -92,7 +94,7 @@ void CompleteMemory(void* request,void* bundle){
  std::function<void(void*)> completed;
  {
   std::lock_guard<std::mutex> lock(memoryMutex);auto it=memoryRequests.find(request);if(it==memoryRequests.end())return;
-  if(bundle)memoryBundles.emplace(bundle,MemoryBundle{Ref::Make(bundle,false),it->second.stream,it->second.owner,it->second.view,it->second.bytes,it->second.fileIdentity});
+  if(bundle){memoryBundles.emplace(bundle,MemoryBundle{Ref::Make(bundle,false),it->second.stream,it->second.owner,it->second.view,it->second.bytes,it->second.fileIdentity});memoryBundleCount.store(memoryBundles.size(),std::memory_order_release);}
   else Log("[ENTRY-RULE-LOAD-FAILED] request=%p archiveStream=1 nativeBundleNull=1",request);
   completed=std::move(it->second.completed);memoryRequests.erase(it);memoryWork=!memoryRequests.empty()||!memoryUnloads.empty();
  }
@@ -156,7 +158,7 @@ void* SubmitStream(Ref stream,std::shared_ptr<const void> owner,uint32_t crc,boo
  // LoadFromMemory eagerly decompresses through a different game reader.
  auto result=icall?icall(stream.Get(),crc,bufferSize):RuntimeShapes::Call(asynchronous?api.streamAsync:api.stream,nullptr,args);
  if(result){if(asynchronous)RetainMemory(result,stream,std::move(owner),std::move(view),std::move(completed),std::move(fileIdentity));else{
-  auto rooted=Ref::Make(result,false);std::lock_guard<std::mutex> lock(memoryMutex);memoryBundles.emplace(result,MemoryBundle{std::move(rooted),std::move(stream),std::move(owner),std::move(view),{},std::move(fileIdentity)});
+  auto rooted=Ref::Make(result,false);std::lock_guard<std::mutex> lock(memoryMutex);memoryBundles.emplace(result,MemoryBundle{std::move(rooted),std::move(stream),std::move(owner),std::move(view),{},std::move(fileIdentity)});memoryBundleCount.store(memoryBundles.size(),std::memory_order_release);
  }}return result;
 }
 void* LoadMemory(void* array,uint32_t crc,bool asynchronous){

@@ -1,10 +1,23 @@
-# EFF：终末地资源替换框架
+# EFF-HotFix：终末地资源替换框架（Reload 热修版）
 
 [English](README_EN.md)
 
+> [!IMPORTANT]
+> 本仓库基于官方 [ssice-a/EFF](https://github.com/ssice-a/EFF) `v2.0.12` 构建，专门修复游戏内按 `F10`（或自定义 `reload` 热键）动态开关 / 热重载 Mod 时的模型拉丝崩坏与失效问题。
+
+## HotFix 修复内容（v2.0.12-hotfix.2）
+
+- **修复进场景长时间卡顿（`~38s → 0s`）**：修复 `EiemDemandLogicalAssetLookup` 与 `DemandLoadingProbe::Current()` 对独立 `.asset` 网格（如角色 LOD0 `.asset`）漏匹配导致被误记入 `state->unresolved`、进而在每次资源加载时反复全表扫描 `SharedInputs` 的问题；同时将热路径中的 `IsBadReadPtr` / `IsBadWritePtr` 替换为零异常开销的用户态指针校验，并将日志改为 64KB 缓冲定时刷盘。
+- **消除编队切换角色停顿（`~2s → 秒切`）**：`EiemNativeRandomAccess` 对 `<= 32 MB` 的冻结作者资源采用内存只读快照替代 `%TEMP%` 同步写盘，新增 `AssetsFiltered` 预过滤 `pathId`/`classId` 以跳过无关 LZ4 块解压并缓存容器 `m_Container` 索引；`EiemNativeSpliceView` 自动合并归档中相邻未压缩碎片块（消除千余次 `4B`/`16B` 碎片流切分）。
+- **修复 `0 → 1` 与 `1 → 0 → 1` 热重载模型变形**：补齐 `DemandGenerationReload::Affected()` 对目标角色原版 Mesh 名称（兼容 `(Instance)` / `(Clone)` 实例后缀）的匹配逻辑，解决「未开 Mod 进游戏后再开启 Mod 按 Reload」以及「关闭 Mod 后再次开启」时，场上角色、UI 展示模型与缓存 Prefab 未触发完整重建与骨骼重绑导致的网格拉丝崩坏问题。
+- **修复原生 `AssetBundle` (`CAB-*`) 重名冲突**：在提交 `versionedRoot` 替换包前，自动排空处于 `BundleWaitUnloadState` 的空闲反向依赖代理并安全卸载已驻留的同名原生源包；同时在 `1 → 0` 切回原版直通加载时自动释放合成 `CAB` 身份，杜绝因 Unity 拒绝加载同名 `CAB-*` 而回退旧网格。
+- **双工具链编译兼容**：补充 MSVC 与 Clang / Zig C++ 双编译器兼容支持。
+
+---
+
 EFF 在《明日方舟：终末地》创建资源和实例前应用 Mod。AnimeStudio 导出来源，Blender 制作并编译独立 Mod，EFF DLL 读取结果并完成游戏内加载与热重载。
 
-配套发布：**EFF v2.0.5、EFF Blender v0.50.2、AnimeStudio v1.9.1**。DLL 仅接受 Format 3；旧格式由 EFF Mod Manager v0.2.1 离线迁移。
+配套版本：**EFF v2.0.12-hotfix.2、EFF Blender v0.50.7、EFF Mod Manager v0.2.3、AnimeStudio v1.9.5**。DLL 仅接受 Format 3；旧格式由 EFF Mod Manager 离线迁移。
 
 首次制作 Mod 可先阅读带截图的简易教程：[中文](Mod%20Tutorial.md) · [English](Mod%20Tutorial_EN.md)。
 
@@ -21,7 +34,10 @@ EFF 在《明日方舟：终末地》创建资源和实例前应用 Mod。AnimeS
 
 ## 安装
 
-从 [EFF Releases](https://github.com/ssice-a/EFF/releases) 下载 `EFF_v2.0.5_dll.zip`。退出游戏，将 ZIP 解压到 `Endfield.exe` 所在目录。当前代理转发支持 Windows 系统目录为 `C:\Windows` 的安装；其他系统目录尚不支持。更新时保留自己的 `plugin/eff.ini`、`plugin/mods/` 和各 Mod 的 `state.ini`。
+前往 [EFF-HotFix Releases](https://github.com/BakaMai/EFF-HotFix/releases/latest) 按你的环境选择对应文件（操作前请先退出游戏）：
+
+- **已有 EFF 升级 / 与 EFMI 共存用户（推荐）**：下载单文件 **`eff.dll`**，直接覆盖 `Endfield.exe` 所在目录下的 `plugin/eff.dll`。此方式不会覆盖你原有的 `plugin/eff.ini` 快捷键设置，也不会覆盖 EFMI 或 [EFF-EFMI-Compatibility-Plugin](https://github.com/BakaMai/EFF-EFMI-Compatibility-Plugin) 的加载器文件。
+- **全新独立安装 EFF**：下载完整包 **`EFF_v2.0.12-hotfix.2_dll.zip`**，解压到 `Endfield.exe` 所在目录（当前代理转发支持 Windows 系统目录为 `C:\Windows` 的安装）。
 
 ```text
 d3dcompiler_47.dll
