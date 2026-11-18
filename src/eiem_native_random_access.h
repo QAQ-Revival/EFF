@@ -2,6 +2,7 @@
 #include "eiem_native_view_writer.h"
 #include "eiem_serialized_writer.h"
 #include "eiem_input_span_view.h"
+#include "eiem_load_performance.h"
 #include <array>
 #include <atomic>
 #include <list>
@@ -20,6 +21,11 @@ struct Limits {
   size_t cacheBytes = 4 * 1024 * 1024;
   size_t readBytes = 64 * 1024 * 1024;
 };
+// A fixed input and fixed limits cannot succeed when retried in the same
+// manifest generation. Keep this distinct from transient dependency failures.
+struct InspectionBudgetExceeded : std::runtime_error {
+  explicit InspectionBudgetExceeded(const char* reason="native inspection read budget exhausted") : std::runtime_error(reason) {}
+};
 struct Statistics {
   size_t reads = 0, encodedBytes = 0, inflatedBytes = 0, inflatedBlocks = 0;
   size_t cacheHits = 0, cacheResident = 0, cachePeak = 0, largestBlock = 0;
@@ -31,9 +37,8 @@ class File {
   size_t available_ = 0;
   BY_HANDLE_FILE_INFORMATION stamp_{};
   std::mutex mutex_;
-  std::shared_ptr<const Bytes> memory_;
-  std::atomic<const Bytes*> memoryPtr_{nullptr};
   bool frozen_ = false;
+  File() = default;
 public:
   File(const std::filesystem::path& path, uint64_t offset, bool immutableAuthor = false) : offset_(offset) {
     handle_ = CreateFileW(path.c_str(), GENERIC_READ,
@@ -54,81 +59,74 @@ public:
   size_t Size() const { return available_; }
   // A retained handle survives rename/delete, but does not isolate in-place
   // writes. Only actual author payload demands freeze their backing bytes.
-  // Metadata-only catalog reads and original game ranges stay lazy.
+  // Metadata-only catalog reads and original game ranges stay lazy. The copy
+  // uses bounded scratch memory and is deleted by Windows on close/crash.
   void Freeze() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (frozen_) return;
-    struct Handles {
-      HANDLE source = INVALID_HANDLE_VALUE, snapshot = INVALID_HANDLE_VALUE;
-      ~Handles() { if (source != INVALID_HANDLE_VALUE) CloseHandle(source);
-                   if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot); }
-    } held;
+    auto snapshot = CopyRange(0, available_);
+    std::swap(handle_, snapshot->handle_);
+    offset_ = 0;
+    stamp_ = snapshot->stamp_;
+    frozen_ = true;
+  }
+  std::unique_ptr<File> SnapshotRange(size_t start, size_t length) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Require(start <= available_ && length <= available_ - start, "author snapshot range exceeds source");
+    return CopyRange(start, length);
+  }
+private:
+  std::unique_ptr<File> CopyRange(size_t start, size_t length) {
+    EiemLoadPerformance::Scope performance(EiemLoadPerformance::AuthorSnapshot);
+    performance.hit=true;
+    struct SourceHandle {
+      HANDLE value;
+      ~SourceHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    };
     // Reopen the same file object, not its possibly replaced pathname. Deny
     // concurrent writers while copying, while allowing atomic replacement.
-    held.source = ReOpenFile(handle_, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
-                             FILE_FLAG_SEQUENTIAL_SCAN);
-    Require(held.source != INVALID_HANDLE_VALUE, "author resource is being written; retry loading after replacement completes");
+    SourceHandle held{ReOpenFile(handle_, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                 FILE_FLAG_SEQUENTIAL_SCAN)};
+    Require(held.value != INVALID_HANDLE_VALUE, "author resource is being written; retry loading after replacement completes");
     VerifyStable();
-    if (available_ <= 32 * 1024 * 1024) {
-      LARGE_INTEGER position{}; position.QuadPart = LONGLONG(offset_);
-      Require(SetFilePointerEx(held.source, position, nullptr, FILE_BEGIN), "author snapshot source seek failed");
-      auto snapshot = std::make_shared<Bytes>(available_);
-      for (size_t at = 0; at < available_;) {
-        auto count = DWORD(std::min(available_ - at, size_t(1024 * 1024))); DWORD read = 0;
-        Require(ReadFile(held.source, snapshot->data() + at, count, &read, nullptr) && read == count,
-                "author snapshot source read truncated");
-        at += count;
-      }
-      VerifyStable();
-      CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE;
-      offset_ = 0; memory_ = std::move(snapshot);
-      memoryPtr_.store(memory_.get(), std::memory_order_release);
-      frozen_ = true;
-      return;
-    }
     wchar_t temporary[MAX_PATH + 1]{};
-    auto length = GetTempPathW(MAX_PATH + 1, temporary);
-    Require(length && length <= MAX_PATH, "author snapshot temporary path unavailable");
+    auto pathLength = GetTempPathW(MAX_PATH + 1, temporary);
+    Require(pathLength && pathLength <= MAX_PATH, "author snapshot temporary path unavailable");
     auto directory = std::filesystem::path(temporary) / L"EFF-demand-snapshots";
     std::error_code error; std::filesystem::create_directories(directory, error);
     Require(!error, "author snapshot temporary directory unavailable");
     static std::atomic<uint64_t> serial{0};
     auto path = directory / (std::to_wstring(GetCurrentProcessId()) + L"-" +
         std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(serial.fetch_add(1)) + L".snapshot");
-    held.snapshot = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
+    std::unique_ptr<File> snapshot(new File);
+    snapshot->handle_ = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
         FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    Require(held.snapshot != INVALID_HANDLE_VALUE, "author resource snapshot creation failed");
-    LARGE_INTEGER position{}; position.QuadPart = LONGLONG(offset_);
-    Require(SetFilePointerEx(held.source, position, nullptr, FILE_BEGIN), "author snapshot source seek failed");
+    Require(snapshot->handle_ != INVALID_HANDLE_VALUE, "author resource snapshot creation failed");
+    LARGE_INTEGER position{}; position.QuadPart = LONGLONG(offset_ + start);
+    Require(SetFilePointerEx(held.value, position, nullptr, FILE_BEGIN), "author snapshot source seek failed");
     std::array<unsigned char, 64 * 1024> scratch{};
-    for (size_t at = 0; at < available_;) {
-      auto count = DWORD(std::min(available_ - at, scratch.size())); DWORD read = 0, written = 0;
-      Require(ReadFile(held.source, scratch.data(), count, &read, nullptr) && read == count,
+    for (size_t at = 0; at < length;) {
+      auto count = DWORD(std::min(length - at, scratch.size())); DWORD read = 0, written = 0;
+      Require(ReadFile(held.value, scratch.data(), count, &read, nullptr) && read == count,
               "author snapshot source read truncated");
-      Require(WriteFile(held.snapshot, scratch.data(), count, &written, nullptr) && written == count,
+      Require(WriteFile(snapshot->handle_, scratch.data(), count, &written, nullptr) && written == count,
               "author resource snapshot write failed");
       at += count;
     }
     VerifyStable();
-    BY_HANDLE_FILE_INFORMATION snapshotStamp{};
-    Require(GetFileInformationByHandle(held.snapshot, &snapshotStamp), "author snapshot stamp unavailable");
-    CloseHandle(handle_); handle_ = held.snapshot; held.snapshot = INVALID_HANDLE_VALUE;
-    offset_ = 0; stamp_ = snapshotStamp; frozen_ = true;
+    Require(GetFileInformationByHandle(snapshot->handle_, &snapshot->stamp_), "author snapshot stamp unavailable");
+    snapshot->available_ = length;
+    snapshot->frozen_ = true;
+    EiemLoadPerformance::Bytes(EiemLoadPerformance::AuthorSnapshot,length);
+    return snapshot;
   }
+public:
   size_t SnapshotBytes() const { return frozen_ ? available_ : 0; }
   void ReadAt(size_t at, unsigned char* output, size_t size) {
+    EiemLoadPerformance::Scope performance(EiemLoadPerformance::NativeRead);performance.hit=true;
     Require(at <= available_ && size <= available_ - at, "native file read exceeds observed range");
-    if (!size) return;
-    if (const auto* mem = memoryPtr_.load(std::memory_order_acquire)) {
-      std::memcpy(output, mem->data() + at, size);
-      return;
-    }
     std::lock_guard<std::mutex> lock(mutex_);
-    if (memory_) {
-      std::memcpy(output, memory_->data() + at, size);
-      return;
-    }
     LARGE_INTEGER position{}; position.QuadPart = LONGLONG(offset_ + at);
     Require(SetFilePointerEx(handle_, position, nullptr, FILE_BEGIN), "native range seek failed");
     for (size_t p = 0; p < size;) {
@@ -136,9 +134,9 @@ public:
       Require(ReadFile(handle_, output + p, count, &read, nullptr) && read == count,
               "native range source truncated"); p += read;
     }
+    EiemLoadPerformance::Bytes(EiemLoadPerformance::NativeRead,size);
   }
   void VerifyStable() const {
-    if (memoryPtr_.load(std::memory_order_acquire)) return;
     BY_HANDLE_FILE_INFORMATION now{};
     Require(GetFileInformationByHandle(handle_, &now) &&
         now.nFileSizeHigh == stamp_.nFileSizeHigh && now.nFileSizeLow == stamp_.nFileSizeLow &&
@@ -165,11 +163,12 @@ class DecodedViewSource {
       auto bytes = it->bytes; cache_.splice(cache_.begin(), cache_, it); return bytes;
     }
     const auto& block = blocks_.at(index).block;
-    Require(block.encoded <= blockLimit_ && block.decoded <= blockLimit_,
-            "native streamed block budget exhausted");
+    if(!(block.encoded <= blockLimit_ && block.decoded <= blockLimit_))throw InspectionBudgetExceeded{"native streamed block budget exhausted"};
     Bytes encoded(block.encoded); source_(blocks_[index].offset, encoded.data(), encoded.size());
+    EiemLoadPerformance::Scope performance(EiemLoadPerformance::NativeStreamDecode);performance.hit=true;
     EndfieldInput::CryptBlock(encoded);
     auto decoded = std::make_shared<const Bytes>(Lz4(encoded.data(), encoded.size(), block.decoded, true));
+    EiemLoadPerformance::Bytes(EiemLoadPerformance::NativeStreamDecode,decoded->size());
     pinned_.reset(); pinnedIndex_ = SIZE_MAX;
     if (decoded->size() <= cacheLimit_) {
       while (!cache_.empty() && decoded->size() > cacheLimit_ - cacheResident_) {
@@ -222,8 +221,8 @@ class Reader {
   mutable std::weak_ptr<DecodedViewSource> decodedView_;
   void Source(size_t at, unsigned char* output, size_t size) {
     Require(at <= sourceSize_ && size <= sourceSize_ - at, "native range read exceeds source");
-    Require(stats.encodedBytes <= limits.readBytes && size <= limits.readBytes - stats.encodedBytes,
-            "native inspection read budget exhausted");
+    if(stats.encodedBytes > limits.readBytes || size > limits.readBytes - stats.encodedBytes)
+      throw InspectionBudgetExceeded{};
     source_(at, output, size); ++stats.reads; stats.encodedBytes += size;
   }
   std::shared_ptr<const Bytes> Block(size_t index) {
@@ -232,12 +231,13 @@ class Reader {
       auto bytes = it->bytes; cache_.splice(cache_.begin(), cache_, it); ++stats.cacheHits; return bytes;
     }
     const auto& block = directory.blocks.at(index);
-    Require(block.block.encoded <= limits.blockBytes && block.block.decoded <= limits.blockBytes,
-            "native inspection block budget exhausted");
+    if(!(block.block.encoded <= limits.blockBytes && block.block.decoded <= limits.blockBytes))throw InspectionBudgetExceeded{"native inspection block budget exhausted"};
     pinned_.reset(); pinnedIndex_=SIZE_MAX; stats.pinnedBytes=0;
     Bytes encoded(block.block.encoded); Source(block.offset, encoded.data(), encoded.size());
+    EiemLoadPerformance::Scope performance(EiemLoadPerformance::NativeDecode);performance.hit=true;
     EndfieldInput::CryptBlock(encoded);
     auto decoded = std::make_shared<const Bytes>(Lz4(encoded.data(), encoded.size(), block.block.decoded, true));
+    EiemLoadPerformance::Bytes(EiemLoadPerformance::NativeDecode,decoded->size());
     ++stats.inflatedBlocks; stats.inflatedBytes += decoded->size();
     stats.largestBlock = std::max(stats.largestBlock, decoded->size());
     if (decoded->size() <= limits.cacheBytes) {
@@ -257,12 +257,12 @@ public:
   EiemNativeViewWriter::Directory directory;
   Reader(size_t sourceSize, ReadRange source, Limits settings = {})
       : source_(std::move(source)), sourceSize_(sourceSize), limits(settings) {
+    EiemLoadPerformance::Scope performance(EiemLoadPerformance::NativeDirectory);
     Require(bool(source_) && sourceSize >= 48, "native range source/header absent");
     headerBytes.resize(48); Source(0, headerBytes.data(), 48);
     header = EndfieldInput::ReadHeader(headerBytes);
     Require(header.bytes <= sourceSize_, "native header exceeds source range");
-    Require(header.compressedInfo <= limits.directoryBytes && header.decodedInfo <= limits.directoryBytes,
-            "native inspection directory budget exhausted");
+    if(!(header.compressedInfo <= limits.directoryBytes && header.decodedInfo <= limits.directoryBytes))throw InspectionBudgetExceeded{"native inspection directory budget exhausted"};
     auto at = header.flags & 0x80 ? header.bytes - header.compressedInfo : header.prefix;
     Bytes info(header.compressedInfo); Source(at, info.data(), info.size());
     directory = EiemNativeViewWriter::ReadDirectory(header, std::move(info));
@@ -284,20 +284,21 @@ public:
     }
   }
   Bytes ReadAt(size_t at, size_t size, size_t budget) {
-    Require(size <= budget, "native inspection allocation budget exhausted");
+    if(!(size <= budget))throw InspectionBudgetExceeded{"native inspection allocation budget exhausted"};
     Bytes bytes(size); ReadAt(at, bytes.data(), size); return bytes;
   }
   void DiscardDecodedCache() {
     cache_.clear();pinned_.reset();pinnedIndex_=SIZE_MAX;stats.cacheResident=0;stats.pinnedBytes=0;
   }
   SerializedLayout Layout(const EiemNativeViewWriter::Member& member) {
+    EiemLoadPerformance::Scope performance(EiemLoadPerformance::NativeMetadata);
     Require(member.size >= 48, "native member has no serialized header");
     auto prefix = ReadAt(member.offset, 48, 48);
     EiemNativeInput::Reader h(prefix, 20, true);
     auto metadata = size_t(h.Get(4)), full = h.Get(8), data = h.Get(8);
     Require(full == member.size && data <= full && data >= 48 && metadata <= data - 48,
             "native member serialized header differs");
-    Require(metadata <= limits.metadataBytes, "native inspection metadata budget exhausted");
+    if(!(metadata <= limits.metadataBytes))throw InspectionBudgetExceeded{"native inspection metadata budget exhausted"};
     prefix.resize(AddSize(48, metadata));
     ReadAt(member.offset + 48, prefix.data() + 48, metadata);
     return ParseSerialized(prefix, member.size);
@@ -365,7 +366,7 @@ public:
       auto at = cursor.position; Skip(type, child, cursor);
       const auto& name = type.nodes[child].name; if (!wanted.count(name)) continue;
       auto size = cursor.position-at, padding = (at-begin)&3;
-      Require(size <= limits.fieldBytes, "native inspection field budget exhausted");
+      if(!(size <= limits.fieldBytes))throw InspectionBudgetExceeded{"native inspection field budget exhausted"};
       Bytes bytes(AddSize(padding,size)); ReadAt(at,bytes.data()+padding,size);
       EiemNativeInput::Reader value(bytes,padding); auto decoded=ReadValue(type,child,value,0);
       Require(value.p==bytes.size()&&result.emplace(name,std::move(decoded)).second,"native projected field extent/identity differs");
@@ -388,64 +389,58 @@ public:
     for(auto child:type.nodes.at(0).children){auto found=values.find(type.nodes.at(child).name);if(found!=values.end())result.children.push_back(std::move(found->second));}
     return result;
   }
-  std::vector<Asset> AssetsFiltered(const EiemNativeViewWriter::Member& member, const SerializedLayout& layout,
-      const std::string* filterPath = nullptr, int filterClassId = 0) {
-    std::vector<Asset> result;
-    for (auto id : layout.order) {
-      const auto& type = layout.types.at(layout.objects.at(id).type); if (type.classId != 142) continue;
-      auto fields = Fields(member,layout,id,{"m_Container"});
-      for (const auto& row : ArrayValue(type,fields.at("m_Container")).children) {
-        const auto& key=Child(type,row,"first");
-        Asset asset; asset.path=Text(key.raw.data(),key.raw.size());
-        std::transform(asset.path.begin(),asset.path.end(),asset.path.begin(),[](unsigned char c){return char(std::tolower(c));});
-        if (filterPath && asset.path != *filterPath) continue;
-        const auto& info=Child(type,row,"second");
-        const auto& ptr=Child(type,info,"asset"); auto file=Integer(Child(type,ptr,"m_FileID"));
-        Require(file<=layout.externals.size(),"native container external index differs");
-        asset.cab=file?layout.externals[size_t(file)-1]:member.name;
-        asset.pathId=int64_t(Integer(Child(type,ptr,"m_PathID")));
-        auto target=layout.objects.find(asset.pathId);
-        if (!file && target!=layout.objects.end()) { const auto& t=layout.types.at(target->second.type); asset.classId=t.classId; asset.type=t.hash;
-          if (filterClassId && asset.classId != filterClassId) continue;
-          if (std::any_of(t.nodes[0].children.begin(),t.nodes[0].children.end(),[&](size_t n){return t.nodes[n].name=="m_Name";})) {
-            auto name=Fields(member,layout,asset.pathId,{"m_Name"}); const auto& v=name.at("m_Name"); asset.asset=Text(v.raw.data(),v.raw.size());
-          }
-        } else if (filterClassId) {
-          continue;
-        }
-        result.push_back(std::move(asset));
-      }
-    }
-    return result;
-  }
-  std::vector<Asset> Assets(const EiemNativeViewWriter::Member& member, const SerializedLayout& layout) {
-    return AssetsFiltered(member, layout, nullptr, 0);
-  }
-  // A prefab's embedded objects need not have their own container entries.
-  // Only expose references owned by the exact requested container's native
-  // preload interval; callers still verify the referenced object's class/name.
-  std::vector<NativeReference> ContainerPreloads(const EiemNativeViewWriter::Member& member,
-      const SerializedLayout& layout,const std::string& path) {
-    std::set<NativeReference> result;
+  struct ContainerEntry {
+    Asset asset;
+    int64_t owner=0;
+    size_t preloadIndex=0,preloadSize=0;
+  };
+  // Semantic directory rows, independent of target count. Object names and
+  // preload tables remain lazy so unrelated payloads are not inspected.
+  std::vector<ContainerEntry> Containers(const EiemNativeViewWriter::Member& member,const SerializedLayout& layout) {
+    std::vector<ContainerEntry> result;
     for(auto id:layout.order){const auto& type=layout.types.at(layout.objects.at(id).type);if(type.classId!=142)continue;
       auto fields=Fields(member,layout,id,{"m_Container"});
-      std::vector<std::pair<size_t,size_t>> ranges;
-      for(const auto& row:ArrayValue(type,fields.at("m_Container")).children){const auto& key=Child(type,row,"first");
-        auto logical=Text(key.raw.data(),key.raw.size());
-        std::transform(logical.begin(),logical.end(),logical.begin(),[](unsigned char c){return char(std::tolower(c));});
-        if(logical!=path)continue;const auto& info=Child(type,row,"second");
-        ranges.emplace_back(size_t(Integer(Child(type,info,"preloadIndex"))),size_t(Integer(Child(type,info,"preloadSize"))));
+      for(const auto& row:ArrayValue(type,fields.at("m_Container")).children){
+        ContainerEntry entry;entry.owner=id;
+        const auto& key=Child(type,row,"first");const auto& info=Child(type,row,"second");const auto& ptr=Child(type,info,"asset");
+        auto file=Integer(Child(type,ptr,"m_FileID"));Require(file<=layout.externals.size(),"native container external index differs");
+        auto& asset=entry.asset;asset.path=Text(key.raw.data(),key.raw.size());
+        std::transform(asset.path.begin(),asset.path.end(),asset.path.begin(),[](unsigned char c){return char(std::tolower(c));});
+        asset.cab=file?layout.externals[size_t(file)-1]:member.name;asset.pathId=int64_t(Integer(Child(type,ptr,"m_PathID")));
+        entry.preloadIndex=size_t(Integer(Child(type,info,"preloadIndex")));entry.preloadSize=size_t(Integer(Child(type,info,"preloadSize")));
+        auto target=layout.objects.find(asset.pathId);
+        if(!file&&target!=layout.objects.end()){const auto& t=layout.types.at(target->second.type);asset.classId=t.classId;asset.type=t.hash;}
+        result.push_back(std::move(entry));
       }
-      if(ranges.empty())continue;
-      auto preloads=Fields(member,layout,id,{"m_PreloadTable"});const auto& values=ArrayValue(type,preloads.at("m_PreloadTable")).children;
-      for(const auto& range:ranges){Require(range.first<=values.size()&&range.second<=values.size()-range.first,"native container preload range differs");
-        for(size_t i=range.first;i<range.first+range.second;++i){const auto& pointer=values[i];auto file=Integer(Child(type,pointer,"m_FileID"));
-          Require(file<=layout.externals.size(),"native container preload external index differs");
-          auto object=int64_t(Integer(Child(type,pointer,"m_PathID")));if(object)result.emplace(file?layout.externals[size_t(file)-1]:member.name,object);
+    }return result;
+  }
+  std::vector<NativeReference> Preloads(const EiemNativeViewWriter::Member& member,const SerializedLayout& layout,int64_t owner) {
+    const auto& type=layout.types.at(layout.objects.at(owner).type);auto fields=Fields(member,layout,owner,{"m_PreloadTable"});
+    std::vector<NativeReference> result;
+    for(const auto& pointer:ArrayValue(type,fields.at("m_PreloadTable")).children){
+      auto file=Integer(Child(type,pointer,"m_FileID"));Require(file<=layout.externals.size(),"native container preload external index differs");
+      result.emplace_back(file?layout.externals[size_t(file)-1]:member.name,int64_t(Integer(Child(type,pointer,"m_PathID"))));
+    }return result;
+  }
+  std::vector<Asset> Assets(const EiemNativeViewWriter::Member& member,const SerializedLayout& layout,int classFilter=0) {
+    std::vector<Asset> result;
+    for(auto& entry:Containers(member,layout)){auto& asset=entry.asset;
+      if(classFilter&&asset.classId!=classFilter)continue;
+      auto object=layout.objects.find(asset.pathId);
+      if(asset.cab==member.name&&object!=layout.objects.end()){const auto& type=layout.types.at(object->second.type);
+        if(std::any_of(type.nodes[0].children.begin(),type.nodes[0].children.end(),[&](size_t n){return type.nodes[n].name=="m_Name";})){
+          auto fields=Fields(member,layout,asset.pathId,{"m_Name"});const auto& name=fields.at("m_Name");asset.asset=Text(name.raw.data(),name.raw.size());
         }
-      }
-    }
-    return {result.begin(),result.end()};
+      }result.push_back(std::move(asset));
+    }return result;
+  }
+  std::vector<NativeReference> ContainerPreloads(const EiemNativeViewWriter::Member& member,const SerializedLayout& layout,const std::string& path) {
+    std::set<NativeReference> result;std::map<int64_t,std::vector<NativeReference>> tables;
+    for(const auto& entry:Containers(member,layout)){if(entry.asset.path!=path)continue;
+      auto found=tables.find(entry.owner);if(found==tables.end())found=tables.emplace(entry.owner,Preloads(member,layout,entry.owner)).first;
+      const auto& values=found->second;Require(entry.preloadIndex<=values.size()&&entry.preloadSize<=values.size()-entry.preloadIndex,"native container preload range differs");
+      for(size_t i=entry.preloadIndex;i<entry.preloadIndex+entry.preloadSize;++i)if(values[i].second)result.insert(values[i]);
+    }return {result.begin(),result.end()};
   }
   std::map<uint64_t,Asset> HashAssets(const EiemNativeViewWriter::Member& member, const SerializedLayout& layout) {
     std::map<uint64_t,Asset> result;

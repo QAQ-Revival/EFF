@@ -17,6 +17,7 @@
 #include <deque>
 #include <mutex>
 #include <set>
+#include <string_view>
 
 #include "eiem_mesh_input_builder.h"
 #include "eiem_resource_reload_plan.h"
@@ -63,6 +64,7 @@
 #include "eiem_camera_fade_core.h"
 #include "eiem_package_protocol.h"
 #include "eiem_control_panel_win32.h"
+#include "eiem_effect_relocation.h"
 #if defined(EIEM_EFFECTS_DEBUG)
 #include "eiem_effect_debug_packet.h"
 #endif
@@ -71,6 +73,9 @@
 #endif
 #define APPLEPIE_PLUGIN_IMPL
 #include "applepie_mgr.h"
+#if defined(EIEM_SCRIPT_BINDING_PROBE)
+#include "../tools/diagnostics/script_binding_probe.h"
+#endif
 
 // Production base resources are replaced through serialized loading inputs. The
 // separate Mesh-target acceptance build measures an uncompiled matching route.
@@ -98,6 +103,9 @@ bool SharedDependencies(void*,uint64_t,void*,bool,bool&) noexcept;
 bool AppendSharedDependencies(void*,uint64_t,void*,bool,bool) noexcept;
 bool SharedVfsLoad(uint64_t,uint32_t,bool,void*&) noexcept;
 void Watchdog() noexcept;
+void PumpSharedRetirements() noexcept;
+void ObserveNativeMeshSource(void*,const std::string&) noexcept;
+std::set<EiemDirectory::Identity> ProvenNativeMeshIdentities(void*);
 #endif
 void Retire(void*,uint64_t) noexcept;
 uint64_t BeginVfs(uint64_t) noexcept;uint64_t BeginHelper(void*,void*) noexcept;void EndHelper(uint64_t) noexcept;
@@ -177,17 +185,33 @@ struct ManagedAttachment {
 std::mutex logMutex;
 FILE *logFile = nullptr;
 FILE *logMirror = nullptr;
-ULONGLONG lastLogFlushTick = 0;
-bool logDirty = false;
-void FlushLogs() {
+std::atomic<bool> logDirty{false};
+ULONGLONG logFlushClock = 0; // Protected by logMutex.
+constexpr ULONGLONG logFlushIntervalMs = 250;
+bool ImmediateLog(std::string_view line) {
+  if (line.empty() || line.front() != '[') return false;
+  auto end=line.find(']');if(end==std::string_view::npos)return false;
+  auto tag=line.substr(1,end-1);
+  if(tag=="BUILD")return true;
+  while(!tag.empty()) {
+    auto separator=tag.find('-');auto part=tag.substr(0,separator);
+    if(part=="FATAL"||part=="GAP"||part=="ERROR"||part=="FAIL"||part=="FAILED"||
+       part=="FAILURE"||part=="REJECT"||part=="REJECTED"||part=="QUARANTINE"||
+       part=="CRASH"||part=="WATCHDOG"||part=="TIMEOUT")return true;
+    if(separator==std::string_view::npos)break;
+    tag.remove_prefix(separator+1);
+  }
+  return false;
+}
+void FlushLog(bool force = false) {
+  if(!logDirty.load(std::memory_order_acquire))return;
   std::lock_guard<std::mutex> lock(logMutex);
-  if (!logDirty)
-    return;
-  for (auto output : {logFile, logMirror})
-    if (output)
-      fflush(output);
-  lastLogFlushTick = GetTickCount64();
-  logDirty = false;
+  if(!logDirty.load(std::memory_order_relaxed))return;
+  const auto now=GetTickCount64();
+  if(!force&&now-logFlushClock<logFlushIntervalMs)return;
+  if(logFile)fflush(logFile);
+  if(logMirror)fflush(logMirror);
+  logFlushClock=now;logDirty.store(false,std::memory_order_release);
 }
 std::filesystem::path gameDirectory, effDirectory, sessionDirectory;
 HMODULE runtimeModule = nullptr;
@@ -341,21 +365,12 @@ std::atomic<unsigned> captures{0};
 bool CopyRaw(const void *input, void *output, size_t bytes) {
   if (!input || !output || uintptr_t(input) > UINTPTR_MAX - bytes)
     return false;
-  if (!bytes)
-    return true;
-#if defined(_MSC_VER) && !defined(__clang__)
   __try {
     memcpy(output, input, bytes);
     return true;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return false;
   }
-#else
-  if (!ValidUserPointerRange(input, bytes) || !ValidUserPointerRange(output, bytes))
-    return false;
-  memcpy(output, input, bytes);
-  return true;
-#endif
 }
 bool ArrayLength(void *array, size_t *length) {
   uint64_t n = 0;
@@ -1244,8 +1259,16 @@ void CompleteRuleInput(void* request,void* bundle){NativeBundle::CompleteMemory(
 #include "eiem_effect_debug.h"
 #include "eiem_entry_material_animation.h"
 #include "eiem_standalone_effect_mods.h"
+#include "eiem_entry_author_transforms.h"
 #include "eiem_entry_effect_attachments.h"
+#include "eiem_entry_animation_frame.h"
 #include "eiem_entry_demand_generation_reload.h"
+#if defined(EIEM_NATIVE_ANIMATION_PROBE) || defined(EIEM_MOD_ANIMATION_PROBE)
+#include "../tools/diagnostics/native_animation_probe.h"
+#endif
+#if defined(EIEM_MOD_ANIMATION_PROBE)
+#include "../tools/diagnostics/mod_animation_probe.h"
+#endif
 #include "eiem_entry_reload.h"
 
 void ProcessReloadRequests() {
@@ -1258,6 +1281,20 @@ void ProcessReloadRequests() {
 }
 
 void InstallHooks(void **assemblies, size_t count) {
+#if defined(EIEM_SCRIPT_BINDING_PROBE)
+  Observe([&]{
+    auto module=GetModuleHandleW(L"UnityPlayer.dll");wchar_t path[32768]{};
+    Require(module&&GetModuleFileNameW(module,path,32768)&&EiemScriptBindingProbe::Compatible(module),"script-binding probe Unity image signature differs");
+    auto image=EiemDirectory::Read(std::filesystem::path(path));auto digest=EiemDirectory::Sha(image.data(),image.size());
+    Require(EiemDirectory::Hex(digest.data(),digest.size())=="9AA9397A6C5EE4FA083EA379B81FF14019EEBA26A76D15446318D5947FB3D2D0","script-binding probe Unity SHA256 differs");
+    auto output=effDirectory/"script-binding-diagnostics"/("pid-"+std::to_string(GetCurrentProcessId())+".jsonl");
+    Require(EiemScriptBindingProbe::Start(output,uintptr_t(module)),"script-binding probe output unavailable");
+    if(!InstallAddress((char*)module+EiemScriptBindingProbe::bindingRva,"diagnostic-script-binding",(void*)EiemScriptBindingProbe::Binding,(void**)&EiemScriptBindingProbe::original)){
+      EiemScriptBindingProbe::Stop();throw std::runtime_error("script-binding probe hook failed");
+    }
+    Log("[DEBUG-scriptbind-READY] output=%s targets=SphereCollider,EmotionShaderSyncMono eventLimit=512 nativeCallsAdded=0 mutations=0",output.u8string().c_str());
+  });
+#endif
   RuntimeShapes::InstallOptional(assemblies,count);
   // Arm depends on the capture completion trampoline. Finish that binding
   // before enabling controls, memory submission, or file interception.
@@ -1649,6 +1686,7 @@ DWORD StartImpl() {
   InstallHooks(assemblies, count);
   managed.Detach();
   if(!RuntimeControls::panel.Read()) RuntimeControls::PublishPanel();
+  RuntimeControls::panel.diagnostic=[](const std::string& message){Log("[CONTROL-PANEL-GRAPHICS] %s",message.c_str());};
   HANDLE panelThread=CreateThread(nullptr,0,EiemControlPanel::Window::Run,&RuntimeControls::panel,0,nullptr);
   if(panelThread) {CloseHandle(panelThread);Log("[CONTROL-PANEL] workerStarted=1 shortcut=gui selectedModOnly=1");}
   else {RuntimeControls::panel.failed=true;Log("[CONTROL-PANEL-GAP] workerStartFailed=%lu",GetLastError());}
@@ -1676,8 +1714,7 @@ DWORD StartImpl() {
     auto gui=settings.Get().gui;
     bool guiPhysical=RuntimeControls::Down(gui);
     if(guiKey.Press(gui,guiPhysical,active && process==GetCurrentProcessId())) {
-      if(RuntimeControls::panel.failed) Log("[CONTROL-PANEL-GAP] unavailable=1 restartRequired=1");
-      else {
+      {
         RuntimeControls::panel.open=!RuntimeControls::panel.open.load();
         Log("[CONTROL-PANEL] requestedOpen=%d vk=%u modifiers=%u",int(RuntimeControls::panel.open.load()),gui.vk,gui.modifiers);
       }
@@ -1717,7 +1754,7 @@ DWORD StartImpl() {
     RuntimeControls::preferences.Flush(Log);
     EiemLoadPerformance::Flush();
     RuntimeControls::keySettings.Flush(Log);
-    FlushLogs();
+    FlushLog();
     Sleep(25);
   }
 }
@@ -1750,29 +1787,19 @@ void Log(const char *format, ...) {
   if (Entry::logFile) {
     SYSTEMTIME now;
     GetLocalTime(&now);
-    const ULONGLONG tick = GetTickCount64();
-    const bool flushNow =
-        (tick - Entry::lastLogFlushTick >= 200) ||
-        !strncmp(line, "[BUILD]", 7) || !strncmp(line, "[ENTRY", 6) ||
-        strstr(line, "FATAL") != nullptr || strstr(line, "ERROR") != nullptr ||
-        strstr(line, "REJECT") != nullptr || strstr(line, "GAP]") != nullptr ||
-        strstr(line, "FAILED]") != nullptr || strstr(line, "READY]") != nullptr ||
-        strstr(line, "COMMIT") != nullptr || strstr(line, "RELOAD") != nullptr ||
-        strstr(line, "STATS]") != nullptr;
     for (auto output : {Entry::logFile, Entry::logMirror}) {
       if (!output)
         continue;
       fprintf(output, "[%02u:%02u:%02u.%03u] [pid=%lu tid=%lu] %s\n", now.wHour,
               now.wMinute, now.wSecond, now.wMilliseconds,
               GetCurrentProcessId(), GetCurrentThreadId(), line);
-      if (flushNow)
-        fflush(output);
     }
-    if (flushNow) {
-      Entry::lastLogFlushTick = tick;
-      Entry::logDirty = false;
-    } else {
-      Entry::logDirty = true;
+    if(Entry::ImmediateLog(line)) {
+      fflush(Entry::logFile);
+      if(Entry::logMirror)fflush(Entry::logMirror);
+      Entry::logDirty.store(false,std::memory_order_release);
+    } else if(!Entry::logDirty.exchange(true,std::memory_order_acq_rel)) {
+      Entry::logFlushClock=GetTickCount64();
     }
   }
 }

@@ -2,6 +2,7 @@
 #include "eiem_target_mod_precedence.h"
 #include "eiem_demand_generation_routes.h"
 #include "eiem_demand_target_lookup.h"
+#include "eiem_demand_mesh_provenance.h"
 // Creation-before observation, with an explicitly separate native-input
 // acceptance build. The ordinary observation build never changes inputs.
 namespace DemandLoadingProbe {
@@ -12,8 +13,17 @@ namespace R=EiemNativeRandomAccess;
 struct Api {void *lookup=nullptr,*subLookup=nullptr,*packClass=nullptr,*proxyInfo=nullptr,*assetPath=nullptr;size_t packSize=0,bundleOffset=0,assetOffset=0;} api;
 struct Binding {size_t target=0;uint64_t bundle=0,asset=0;std::string cab;int64_t object=0;};
 struct InstalledGeneration;
+struct ProvenNativeMesh {Ref mesh;std::set<Identity> identities;};
 struct Manifest {Ref object;uint64_t serial=0;std::vector<Binding> bindings;std::unordered_set<uint64_t> bundles;std::mutex candidateMutex;std::map<uint64_t,Q::Candidate> candidates;
   std::vector<size_t> unresolved;
+  std::vector<Identity> unresolvedRestorations;
+  std::mutex provenanceMutex;
+  std::map<std::string,std::shared_ptr<const EiemDemandMeshProvenance::Prefab>> provenancePrefabs;
+  std::set<std::string> provenanceMisses;
+  std::map<std::pair<void*,std::string>,Ref> provenPrefabSources;
+  std::map<void*,ProvenNativeMesh> provenMeshes;
+  std::map<Identity,std::pair<uint64_t,uint64_t>> observedMeshBindings;
+  std::set<uint64_t> observedMeshBundles;bool unresolvedObservedMeshes=false;
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
   std::shared_ptr<const InstalledGeneration> catalog;
 #endif
@@ -47,6 +57,7 @@ double ElapsedMs(std::chrono::steady_clock::time_point begin) noexcept {
   return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();
 }
 void LogTiming(uint64_t token,const char* phase,double elapsedMs,const char* detail) noexcept {
+  if(!settings.Get().detailedDiagnostics)return;
   auto ordinal=++timingEvents;if(ordinal>timingEventLimit){++timingDropped;return;}
   Log("[DEMAND-TIMING] event=%llu token=%llu phase=%s elapsedMs=%.3f %s",ordinal,token,phase,elapsedMs,detail);
 }
@@ -57,7 +68,8 @@ namespace N=EiemDemandNativeAssembly;
 namespace M=EiemDemandMaterialAssembly;
 using MaterialPrepare=std::function<M::Shared(const N::Author&,const std::vector<M::Use>&)>;
 using PreparedPublisher=std::function<void(uint64_t,std::shared_ptr<const EiemInputSpanView::View>,bool)>;
-struct PreparedInput {bool ready=false,blocked=false;std::shared_ptr<const EiemInputSpanView::View> view;};
+struct PreparedInput {bool ready=false,blocked=false;std::exception_ptr failure;std::shared_ptr<const EiemInputSpanView::View> view;
+  std::set<std::string> usedMods,usedMaterials;std::set<Identity> usedLogicalDependencies;};
 struct NativeMeshObservation {Ref mesh;std::set<std::string> bundleInputs;};
 std::map<uint64_t,std::shared_ptr<PreparedInput>> preparedInputs;
 struct AuthorRuntime {
@@ -75,7 +87,17 @@ struct InstalledGeneration {
   EiemDemandGenerationDiff::Delta delta;
   std::set<std::string> deltaBundles;
   std::map<Identity,std::set<std::string>> deltaRoutes;
+  std::set<Identity> observedMeshTargets;
+  // Logical identities only: a removed/retargeted Mesh still needs a fresh
+  // baseline input when the game next requests it, including after later F10s.
+  // No old author payload or native object is retained by this history.
+  std::set<Identity> restorationTargets;
 };
+void RetainRestorationTargets(InstalledGeneration& next,const InstalledGeneration* previous){
+  if(previous){next.restorationTargets=previous->restorationTargets;
+    for(const auto& target:previous->targets)next.restorationTargets.insert(target.source);}
+  for(const auto& target:next.targets)next.restorationTargets.erase(target.source);
+}
 // Immutable declarations are shared between manifest generations. Opening
 // them never opens Mesh/Texture/effect payloads or old compiled consumers.
 std::shared_ptr<const InstalledGeneration> installedGeneration;
@@ -92,9 +114,9 @@ std::map<std::tuple<uint64_t,std::string,std::string,std::string>,NativeMeshObse
 std::map<std::tuple<uint64_t,std::string,std::string>,NativeMeshObservation> nativeResourceObservations;
 thread_local bool submittingView=false;
 std::shared_ptr<std::mutex> ScopePreparationLock(uint64_t scope){std::lock_guard<std::mutex> guard(mutex);auto& value=scopePreparationLocks[scope];if(!value)value=std::make_shared<std::mutex>();return value;}
-void PublishPrepared(uint64_t token,std::shared_ptr<const EiemInputSpanView::View> view,bool blocked=false){
+void PublishPrepared(uint64_t token,std::shared_ptr<const EiemInputSpanView::View> view,bool blocked=false,std::exception_ptr failure={}){
   {std::lock_guard<std::mutex> lock(mutex);auto found=preparedInputs.find(token);if(found==preparedInputs.end())return;
-    found->second->view=std::move(view);found->second->blocked=blocked;found->second->ready=true;}
+    found->second->view=std::move(view);found->second->blocked=blocked;found->second->failure=std::move(failure);found->second->ready=true;}
   preparedReady.notify_all();
 }
 void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const std::shared_ptr<R::File>& file,const std::shared_ptr<Manifest>& manifest,
@@ -110,8 +132,10 @@ void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const st
   std::set<std::string> matchedModIds,carrierPartIds;
   ScopeAuthors staged;std::vector<BuiltMeshPart> stagedParts;{std::lock_guard<std::mutex> lock(mutex);auto old=authors.find(scope);if(old!=authors.end())staged=old->second;auto parts=scopeParts.find(scope);if(parts!=scopeParts.end())stagedParts=parts->second;}
   auto nativeName=[](const std::string& value){auto result=value;std::transform(result.begin(),result.end(),result.begin(),[](unsigned char c){return char(std::tolower(c));});return result;};
-  for(size_t mi=0;mi<reader.directory.members.size();++mi){const auto& member=reader.directory.members[mi];if(!(member.flags&4))continue;phase("read-native-member-layout");auto layout=reader.Layout(member);
-    EiemNativeEditTransaction::Member transaction(reader,mi,layout);bool touched=false;
+  for(size_t mi=0;mi<reader.directory.members.size();++mi){const auto& member=reader.directory.members[mi];if(!(member.flags&4))continue;phase("read-native-member-layout");
+    // The transaction owns the parsed source. Matching reads its immutable
+    // baseline instead of retaining another full copy of every type tree.
+    EiemNativeEditTransaction::Member transaction(reader,mi,reader.Layout(member));const auto& layout=transaction.SourceLayout();bool touched=false;
     if(record.candidate==Q::Candidate::Target){
       phase("match-target-meshes");
       std::map<std::string,AssetIndex> selectedByMod;std::map<std::string,std::set<size_t>> bindingIndices;auto hashes=reader.HashAssets(member,layout);std::vector<Asset> names;
@@ -119,7 +143,7 @@ void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const st
         EiemNativeInput::Asset observed;const EiemNativeInput::Asset* selected=nullptr;
         if(binding.object&&nativeName(binding.cab)==nativeName(member.name)){auto object=layout.objects.find(binding.object);if(object!=layout.objects.end()&&layout.types.at(object->second.type).classId==43){observed.cab=member.name;observed.pathId=binding.object;observed.classId=43;observed.type=layout.types.at(object->second.type).hash;selected=&observed;}}
         auto hashed=hashes.find(binding.asset);if(!selected&&binding.asset&&hashed!=hashes.end()&&hashed->second.classId==43&&nativeName(hashed->second.cab)==nativeName(member.name))selected=&hashed->second;
-        if(!selected){if(names.empty())names=reader.AssetsFiltered(member,layout,nullptr,43);for(const auto& candidate:names)if(candidate.classId==43&&candidate.cab==member.name&&nativeName(candidate.path)==nativeName(target.source.path)&&candidate.asset==target.source.asset){selected=&candidate;break;}}
+        if(!selected){if(names.empty())names=reader.Assets(member,layout,43);for(const auto& candidate:names)if(candidate.classId==43&&candidate.cab==member.name&&nativeName(candidate.path)==nativeName(target.source.path)&&candidate.asset==target.source.asset){selected=&candidate;break;}}
         if(!selected)continue;auto asset=*selected;asset.path=target.source.path;asset.asset=target.source.asset;
         if(target.skip)Log("[DEMAND-SKIP-MESH] token=%llu mod=%s target=%s#%s cab=%s pathId=%lld",token,target.mod.c_str(),target.source.path.c_str(),target.source.asset.c_str(),asset.cab.c_str(),asset.pathId);
         auto& targetsForMod=selectedByMod[target.mod];Require(targetsForMod.emplace(target.source,std::move(asset)).second,"two manifest bindings resolved one native Mesh identity");bindingIndices[target.mod].insert(binding.target);
@@ -145,9 +169,9 @@ void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const st
       }
     }
     if(!authorPackages.empty()){
-      phase("compose-authors");auto combined=N::Author::Compose(authorPackages);
+      phase("compose-authors");auto combined=[&]{EiemLoadPerformance::Scope performance(EiemLoadPerformance::DemandCompose);return N::Author::Compose(authorPackages);}();
       phase("stage-mesh-carrier");
-      auto carrier=N::StageCarrier(transaction,reader,mi,*combined,combinedTargets);++carriers;carrierParts+=carrier.parts.size();
+      auto carrier=[&]{EiemLoadPerformance::Scope performance(EiemLoadPerformance::DemandCarrier);return N::StageCarrier(transaction,reader,mi,*combined,combinedTargets);}();++carriers;carrierParts+=carrier.parts.size();
       for(const auto& part:carrier.parts)carrierPartIds.insert(part.part);
       touched|=!carrier.parts.empty();
       if(record.candidate==Q::Candidate::Target){std::set<Identity> refreshed;
@@ -156,8 +180,8 @@ void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const st
         for(const auto& part:carrier.parts){auto duplicate=std::find_if(stagedParts.begin(),stagedParts.end(),[&](const auto& old){return !(old.target<part.target)&&!(part.target<old.target)&&old.part==part.part&&old.cab==part.cab&&old.id==part.id;});if(duplicate==stagedParts.end())stagedParts.push_back(part);}
       }
       phase("restore-staged-mesh-metadata");N::EnsureStagedMeshMetadata(*combined,stagedParts);
-      phase("collect-renderer-material-uses");auto uses=M::CollectUses(transaction.Layout(),member.name,*combined,combinedTargets,
-        [&](int64_t id,const std::set<std::string>& fields){return transaction.Project(id,fields);});
+      phase("collect-renderer-material-uses");auto uses=[&]{EiemLoadPerformance::Scope performance(EiemLoadPerformance::DemandMaterialUses);return M::CollectUses(transaction.Layout(),member.name,*combined,combinedTargets,
+        [&](int64_t id,const std::set<std::string>& fields){return transaction.Project(id,fields);});}();
       M::Shared materials;
       if(!uses.empty()){
         phase("prepare-shared-materials");
@@ -165,8 +189,8 @@ void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const st
         materials=(*materialPrepare)(*combined,uses);Require(materials.references.size()==uses.size(),"native Renderer Material donor group is incomplete");
       }
       phase("stage-renderer-consumer");
-      auto consumer=N::StageConsumer(transaction,*combined,combinedTargets,stagedParts,
-        uses.empty()?nullptr:&materials.references,uses.empty()?nullptr:&materials.closures);
+      auto consumer=[&]{EiemLoadPerformance::Scope performance(EiemLoadPerformance::DemandConsumer);return N::StageConsumer(transaction,*combined,combinedTargets,stagedParts,
+        uses.empty()?nullptr:&materials.references,uses.empty()?nullptr:&materials.closures);}();
       for(const auto& target:combinedTargets){auto selected=combined->package.targetIndex.find(target.first);
         if(selected==combined->package.targetIndex.end()||!combined->package.rules.at(selected->second).skip)continue;
         NativeReference mesh{target.second.cab,target.second.pathId};std::vector<int64_t> renderers;
@@ -179,18 +203,20 @@ void PrepareReplacement(uint64_t token,uint64_t scope,R::Reader& reader,const st
       if(consumer.result.matches&&usedMods)for(const auto& row:staged)if(!row.second.targets.empty())usedMods->insert(row.first);
       consumerMatches+=consumer.result.matches;touched|=consumer.result.matches!=0;
     }
-    if(touched||transaction.ChangedObjects()||transaction.AddedObjects()){phase("commit-member-rewrite");rewrites.push_back(transaction.Commit().rewrite);}
+    if(touched||transaction.ChangedObjects()||transaction.AddedObjects()){phase("commit-member-rewrite");EiemLoadPerformance::Scope performance(EiemLoadPerformance::DemandEditCommit);rewrites.push_back(transaction.Commit().rewrite);}
   }
   auto commitScope=[&](){std::lock_guard<std::mutex> lock(mutex);authors[scope]=std::move(staged);scopeParts[scope]=std::move(stagedParts);};
   if(rewrites.empty()){
     std::shared_ptr<const EiemInputSpanView::View> identityView;
     if(record.candidate==Q::Candidate::Target||record.candidate==Q::Candidate::Yes){
+      EiemLoadPerformance::Scope performance(EiemLoadPerformance::DemandView);
       auto passthrough=EiemNativeSpliceView::BuildRanges(reader,{});
       identityView=passthrough.Bind([file](size_t at,unsigned char* out,size_t n){file->ReadAt(at,out,n);});
     }
     file->VerifyStable();commitScope();publish(std::move(identityView));return;
   }
   phase("encode-native-input-view");
+  EiemLoadPerformance::Scope viewPerformance(EiemLoadPerformance::DemandView);
   auto prepared=EiemNativeSpliceView::BuildRanges(reader,rewrites,32*1024*1024);file->VerifyStable();auto view=prepared.Bind([file](size_t at,unsigned char* out,size_t n){file->ReadAt(at,out,n);});
   std::string modIds,partIds;
   for(const auto& mod:matchedModIds){if(!modIds.empty())modIds+=',';modIds+=mod;}
@@ -359,7 +385,20 @@ std::shared_ptr<Manifest> Current(void* object) {
     if(activeTargets[i].skip)Log("[DEMAND-SKIP-MANIFEST] scope=%llu mod=%s target=%s#%s resolved=1 bundle=%016llX asset=%016llX",state->serial,activeTargets[i].mod.c_str(),source.path.c_str(),source.asset.c_str(),binding.bundle,binding.asset);
   }
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
-  for(const auto& name:catalog->deltaBundles){auto key=hintKeys.find(name);if(key!=hintKeys.end())state->bundles.insert(key->second);}
+   for(const auto& identity:catalog->observedMeshTargets){Bytes info;bool exact=false;
+    if(!LookupTarget(object,identity,info,exact)){state->unresolvedObservedMeshes=true;continue;}
+    uint64_t bundle=0,asset=0;memcpy(&bundle,info.data()+api.bundleOffset,8);memcpy(&asset,info.data()+api.assetOffset,8);
+    state->observedMeshBundles.insert(bundle);
+    if(exact||(identity.path.size()>=5&&identity.path.compare(identity.path.size()-5,5,".mesh")==0))state->observedMeshBindings.emplace(identity,std::make_pair(bundle,asset));
+    else state->unresolvedObservedMeshes=true;
+   }
+   for(const auto& name:catalog->deltaBundles){auto key=hintKeys.find(name);if(key!=hintKeys.end())state->bundles.insert(key->second);}
+  for(const auto& identity:catalog->restorationTargets){Bytes info;bool exact=false;
+    const bool found=LookupTarget(object,identity,info,exact);
+    if(found){uint64_t bundle=0;memcpy(&bundle,info.data()+api.bundleOffset,sizeof(bundle));if(bundle)state->bundles.insert(bundle);}
+    if(!found||(!exact&&(identity.path.size()<5||identity.path.compare(identity.path.size()-5,5,".mesh"))))
+      state->unresolvedRestorations.push_back(identity);
+  }
   EiemDemandGenerationRoutes::IncludeTargetRoots(state->bundles,catalog->delta.targets,
     [&](const std::string& path,const std::string& asset){
       Bytes info;bool exact=false;const bool found=LookupTarget(object,{path,asset},info,exact);
@@ -439,7 +478,7 @@ Q::Record PrefabAssetRequest(void* manager,void* asset) noexcept {
       CacheCandidate(state,bundle,verdict);
     }
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
-    if(verdict!=Q::Candidate::Target&&verdict!=Q::Candidate::Yes&&!state->unresolved.empty()){
+    if(verdict!=Q::Candidate::Target&&verdict!=Q::Candidate::Yes&&(!state->unresolved.empty()||!state->unresolvedRestorations.empty())){
       auto list=StartupDependencies::NewListForManifest(manifest);
       if(PrepareDependencyGroup(state,bundle,list.Get())){verdict=Q::Candidate::Yes;CacheCandidate(state,bundle,verdict);}
     }
@@ -464,6 +503,12 @@ Q::Record PrefabAssetRequest(void* manager,void* asset) noexcept {
 #endif
 uint64_t BeginVfs(uint64_t hash) noexcept {
   auto previous=helperToken;if(!enabled)return previous;++vfsEvents;
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+  // Production substitutions use generation-specific proxies and isolated
+  // inputs. A source VFS key can outlive F10 in the observation registry; it
+  // must never submit that old, unisolated preparation into a new game load.
+  if(sharedInputsEnabled){helperToken=0;return previous;}
+#endif
   try{auto record=registry.Vfs(hash);helperToken=record.token;if(record.token){auto n=++matchedVfs;if(n<=128)Log("[DEMAND-PROBE-VFS-BEGIN] token=%llu hash=%016llX beforePhysicalTranslation=1",record.token,hash);}else if(vfsEvents<=16)Log("[DEMAND-PROBE-VFS-UNRELATED] hash=%016llX candidateRoute=0 authorPayloadBytes=0",hash);}
   catch(const std::exception& e){helperToken=0;++gaps;LogGap("vfs-route",e.what());}catch(...){helperToken=0;++gaps;LogGap("vfs-route","unknown");}return previous;
 }
@@ -478,7 +523,7 @@ void Dependencies(void* manifest,uint64_t hash,void* list,bool complete,bool dir
     auto verdict=state->bundles.count(hash)?Q::Candidate::Target:EiemMeshTargetDirectory::Candidate(hash,dependencies,state->bundles)?Q::Candidate::Yes:complete?Q::Candidate::No:Q::Candidate::Unknown;
     if(verdict==Q::Candidate::Target||verdict==Q::Candidate::Yes||(!direct&&complete))CacheCandidate(state,hash,verdict);
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
-    if(sharedRequestDepth&&(verdict==Q::Candidate::Yes||verdict==Q::Candidate::Target||!state->unresolved.empty()))
+    if(sharedRequestDepth&&(verdict==Q::Candidate::Yes||verdict==Q::Candidate::Target||!state->unresolved.empty()||!state->unresolvedRestorations.empty()))
       if(PrepareDependencyGroup(state,hash,list)&&verdict!=Q::Candidate::Target){verdict=Q::Candidate::Yes;CacheCandidate(state,hash,verdict);}
 #endif
     if(verdict!=Q::Candidate::Yes&&verdict!=Q::Candidate::Target)return;
@@ -506,6 +551,9 @@ void Retire(void* manifest,uint64_t hash) noexcept {
 }
 uint64_t BeginHelper(void* dir,void* name) noexcept {
   auto previous=helperToken;if(!enabled)return previous;
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+  if(sharedInputsEnabled){helperToken=0;return previous;}
+#endif
   try{auto label=String(name),directory=String(dir);auto selected=registry.Resolve({label,(std::filesystem::u8path(directory)/std::filesystem::u8path(label)).generic_u8string()});helperToken=selected.token?selected.token:previous;
     if(!helperToken&&unknownFiles.load()<16)Log("[DEMAND-PROBE-HELPER-UNKNOWN] dir=%s name=%s identityNotGuessed=1",directory.c_str(),label.c_str());
   }catch(const std::exception& e){helperToken=0;++gaps;LogGap("helper-route",e.what());}catch(...){helperToken=0;++gaps;LogGap("helper-route","unknown");}return previous;
@@ -513,6 +561,9 @@ uint64_t BeginHelper(void* dir,void* name) noexcept {
 void EndHelper(uint64_t previous) noexcept {helperToken=previous;}
 uint64_t BeforeFile(void* path,uint64_t offset,bool asynchronous) noexcept {
   if(!enabled)return 0;
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+  if(sharedInputsEnabled)return 0;
+#endif
   uint64_t selectedToken=0;std::pair<uint64_t,std::pair<std::string,uint64_t>> inspection;bool started=false;
   try{auto physical=String(path);auto record=helperToken?registry.BindFile(helperToken,physical,offset):registry.File(physical,offset);++fileEvents;selectedToken=record.token;
     if(!record.token){auto n=++unknownFiles;if(n<=16)Log("[DEMAND-PROBE-INPUT-UNKNOWN] path=%s offset=%llu async=%d payloadBytesRead=0",physical.c_str(),offset,int(asynchronous));return 0;}
@@ -566,7 +617,12 @@ uint64_t BeforeFile(void* path,uint64_t offset,bool asynchronous) noexcept {
     Log("[DEMAND-PROBE-INPUT] token=%llu bundle=%016llX path=%s offset=%llu async=%d inputBytes=%zu readBytes=%zu decodedBytes=%zu decodedBlocks=%zu totalBlocks=%zu boundMeshes=%zu rendererRefs=%zu exactRefs=%zu inspectMs=%.3f beforeNativeBundleCall=1",record.token,record.bundle,physical.c_str(),offset,int(asynchronous),reader.header.bytes,reader.stats.encodedBytes,reader.stats.inflatedBytes,reader.stats.inflatedBlocks,reader.directory.blocks.size(),bindings,refs,hits,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());return record.token;
   }catch(const std::exception& e){++gaps;Log("[DEMAND-PROBE-GAP] phase=before-input reason=%s",e.what());
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
-    if(started)PublishPrepared(selectedToken,{},true);
+    if(started){
+      auto failure=std::current_exception();bool deterministic=false;
+      try{std::rethrow_exception(failure);}catch(const R::InspectionBudgetExceeded&){deterministic=true;}catch(...){}
+      PublishPrepared(selectedToken,{},true,failure);
+      if(!deterministic){std::lock_guard<std::mutex> lock(mutex);inspected.erase(inspection);preparedInputs.erase(selectedToken);}
+    }
 #else
     if(started){std::lock_guard<std::mutex> lock(mutex);inspected.erase(inspection);}
 #endif
@@ -585,7 +641,7 @@ bool SubmitCurrentHelper(uint32_t crc,bool asynchronous,void*& result) noexcept 
   result=nullptr;
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
   const auto token=helperToken;
-  if(!enabled||!token)return false;
+  if(!enabled||!token||sharedInputsEnabled)return false;
   try{
     if(!SubmitPrepared(token,crc,asynchronous,result)||!result){result=nullptr;return false;}
     Submitted(token,result,asynchronous);
@@ -663,6 +719,9 @@ void* NativeFile(void* path,uint32_t crc,uint64_t offset){return FileResult(path
 void* NativeFileAsync(void* path,uint32_t crc,uint64_t offset){return FileResult(path,crc,offset,true);}
 void Report(int frame) noexcept {
   if(!enabled||frame%300)return;
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+  PumpSharedRetirements();
+#endif
   try{std::lock_guard<std::mutex> lock(mutex);PruneLocked();}catch(const std::exception& e){++gaps;LogGap("periodic-prune",e.what());}catch(...){++gaps;LogGap("periodic-prune","unknown");}
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
   ReportShared(frame);
@@ -690,6 +749,13 @@ std::shared_ptr<const InstalledGeneration> BuildInstalledGeneration(
       for(const auto& rule:author->package.rules)for(const auto& target:rule.second.targets){
         EiemDemandGenerationDiff::Target diff;diff.rule=rule.first;diff.lod=target.first;diff.path=target.second.path;diff.asset=target.second.asset;diff.parts.insert(rule.second.parts.begin(),rule.second.parts.end());diff.skip=rule.second.skip;fingerprint.targets.insert(std::move(diff));
       }
+      // Control-only F10 keeps existing game owners. Transfer their activity
+      // lease, while resource/target changes wait for the new native owners.
+      if(previous){auto old=previous->authors.find(mod);auto stamp=previous->snapshot.find(mod);
+        if(old!=previous->authors.end()&&stamp!=previous->snapshot.end()&&stamp->second.resourceDeclarations==fingerprint.resourceDeclarations&&stamp->second.targets==fingerprint.targets){
+          auto before=stamp->second.files,after=fingerprint.files;before.erase("mod.ini");after.erase("mod.ini");
+          if(before==after)author->catalog->ShareAnimationActivity(*old->second->catalog);
+        }}
       Require(!next.count(mod),"duplicate native Mod id");
       next.emplace(mod,author);graph->push_back(author->package);
       selected.insert(selected.end(),std::make_move_iterator(modTargets.begin()),std::make_move_iterator(modTargets.end()));
@@ -750,10 +816,19 @@ std::shared_ptr<const InstalledGeneration> BuildInstalledGeneration(
     if(!EiemCompiledModSet::StandaloneEffectRoot(row.second->catalog->Root()))runtime->push_back(row.second->package);
     result->packages=runtime;}
   result->delta=EiemDemandGenerationDiff::Compare(previous?previous->snapshot:EiemDemandGenerationDiff::Snapshot{},result->snapshot);
+  RetainRestorationTargets(*result,previous.get());
   Log("[DEMAND-AUTHOR-DECLARATIONS] generation=%llu mods=%zu targets=%zu ms=%.3f meshTextureEffectPayloadBytes=0 compiledInputsRead=0 consumerPfbEnumeration=0",
     (unsigned long long)result->serial,graph->size(),result->targets.size(),std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count());
   Log("[DEMAND-GENERATION-DIFF] generation=%llu changed=%d packages=%zu added=%zu removed=%zu modified=%zu affectedTargets=%zu resourcePayloadBytesRead=0",
     (unsigned long long)result->serial,int(result->delta.changed),result->delta.packages.size(),result->delta.addedPackages.size(),result->delta.removedPackages.size(),result->delta.modifiedPackages.size(),result->delta.targets.size());
+  // Attachments observe the game's existing Meshes. They are deliberately
+  // separate from Replace targets: no author Mesh carrier or versioned native
+  // input is created merely to prove an attachment's logical identity.
+  for(const auto& author:result->authors)for(const auto& row:author.second->package.effects){const auto& effect=row.second;
+    if(IsGamePrefabReplacement(effect))continue;
+    if(!effect.targetPath.empty()&&!effect.targetAsset.empty())result->observedMeshTargets.insert({effect.targetPath,effect.targetAsset});
+    for(const auto& lod:effect.lodTargets)result->observedMeshTargets.insert({lod.path,lod.asset});
+  }
   return result;
 }
 bool InstalledGenerationFilesUnchanged(const InstalledGeneration& value){
@@ -827,7 +902,7 @@ void Install(void** assemblies,size_t count){try{
   hook(bundle,"LoadFromFile_Internal",{"System.String","System.UInt32","System.UInt64"},"UnityEngine.AssetBundle","UnityEngine.AssetBundle::LoadFromFile_Internal(System.String,System.UInt32,System.UInt64)",(void*)NativeFile,(void**)&nativeFile,true);
   hook(bundle,"LoadFromFileAsync_Internal",{"System.String","System.UInt32","System.UInt64"},"UnityEngine.AssetBundleCreateRequest","UnityEngine.AssetBundle::LoadFromFileAsync_Internal(System.String,System.UInt32,System.UInt64)",(void*)NativeFileAsync,(void**)&nativeFileAsync,true);
   enabled=true;Log("[DEMAND-PROBE-READY] beforeNativeBundle=1 beforeNativeAsset=1 partialBlockReader=1 compiledBackendDisabled=1 nativeObjectsCreatedByEff=0");
-  Log("[DEMAND-TIMING-BUDGET] eventLimit=%llu gapLimit=64 matchedVfsBeginLimit=128 candidateAssetLimit=256 phase=route-submit-async-completion-asset-call",timingEventLimit);
+  Log("[DEMAND-TIMING-BUDGET] detailed=%d eventLimit=%llu gapLimit=64 matchedVfsBeginLimit=128 candidateAssetLimit=256 phase=route-submit-async-completion-asset-call",int(settings.Get().detailedDiagnostics),timingEventLimit);
 #if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
   ReadInstalledTargets();InstallSharedInputs(assemblies,count);
   Log("[DEMAND-NATIVE-READY] targets=declarationDriven carrier=originalCabAndPathId consumerBones=creationBefore nativeDeserializerOwnsCreation=1 materialOverrides=shared-native-dependencies effects=lazy-native-inputs controls=author-declarations f10=immutable-generation");

@@ -9,7 +9,7 @@ namespace FullResourceReload {
 using RuntimeShapes::Ref;
 using Plan=EiemResourceReloadPlan::Plan;
 using namespace EiemNativeInput;
-struct Lease {Ref pathHash,handle,source;bool done=false,disposed=false,shared=false;};
+struct Lease {Ref pathHash,handle,source;bool done=false,disposed=false,shared=false,verified=false;};
 struct SharedBundle {Ref object;int id=0;bool unloadCalled=false;};
 struct Bundle {Ref path,request,object,bytes;std::shared_ptr<NativeBundle::FileHold> file;int id=0;bool done=false,owned=false,unloadCalled=false;std::shared_ptr<SharedBundle> shared;};
 // Only verified, completed containers enter this weak index. The owning
@@ -19,8 +19,10 @@ struct Asset {Ref label,request,prefab;bool done=false;};
 struct Route {Ref source,candidate;int sourceId=0,candidateId=0;std::string path;};
 using Routes=std::vector<Route>;
 struct UIModelRequest {Ref loader,callback,closure,proxy,root,instantiateProxy,candidatePrefab;std::string path,error;uint64_t pathHash=0;void* completionInfo=nullptr;int id=0;bool submitted=false,completed=false,cancelled=false,delivered=false;};
+struct PrefabDependency {std::string path;Ref rawAsset;};
 struct Owner {Ref entity,component,root,pathHash;std::string path;int oldRootId=0;std::map<std::string,std::pair<unsigned,int>> originalMeshes;bool viewPart=false;Ref config;
  Ref animation,animationData,weapons,audio,performManager;
+ std::vector<PrefabDependency> prefabDependencies;
  bool directAsset=false;Ref rawAsset;
  bool uiModel=false;Ref uiParent,uiCallback,uiPage;mutable Ref uiLoadedRoot;std::shared_ptr<UIModelRequest> uiRequest;};
 struct PrefabProxyRetainedError:std::runtime_error {using std::runtime_error::runtime_error;};
@@ -99,7 +101,7 @@ struct Api {
  void *uiLuaInstance=nullptr,*uiLuaDo=nullptr,*uiLuaCall=nullptr,*uiArraySet=nullptr,*uiObjectClass=nullptr;
  void *uiLuaKey=nullptr,*uiLuaEncode=nullptr,*uiLuaDecode=nullptr,*uiLuaCodeEquals=nullptr;
  void *uiLuaExceptionMessage=nullptr;
- void *proxyAsset=nullptr,*proxyHash=nullptr,*proxyGet=nullptr,*proxyPath=nullptr,*proxyInfoClass=nullptr,*proxyInfo=nullptr,*proxyAssetPath=nullptr,*proxyTryUnloadImmediately=nullptr,*pathHashField=nullptr;
+ void *proxyAsset=nullptr,*proxyHash=nullptr,*proxyGet=nullptr,*proxyPath=nullptr,*proxyInfoClass=nullptr,*proxyInfo=nullptr,*proxyAssetPath=nullptr,*proxyTryUnloadImmediately=nullptr,*proxyUnloaded=nullptr,*pathHashField=nullptr;
  void *handleUntrackedField=nullptr,*handleUntrackedClass=nullptr,*untrackedAssetGet=nullptr;
  void *rawAssetUnloaded=nullptr,*rawAssetRefCount=nullptr;
 } api;
@@ -180,6 +182,9 @@ using ProxyGetFn=void*(*)(void*);ProxyGetFn originalProxyGet=nullptr;
 void* ProxyGet(void* self){auto source=originalProxyGet(self);if(readingSource||!enabled||!RuntimeShapes::Main()||!source)return source;
  if(!api.proxyPath&&(!api.proxyInfo||!api.proxyAssetPath||!api.proxyInfoClass))return source;
  try{auto path=ProxyLogicalPath(self);
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+  DemandLoadingProbe::ObserveNativeMeshSource(source,path);
+#endif
   return EffectDebug::RouteReplacement(path,source);}
  catch(const std::exception& e){Log("[EFFECT-PREFAB-ROUTE-GAP] phase=asset-proxy-get reason=%s gameResourcePreserved=1",e.what());return source;}catch(...){return source;}}
 std::shared_ptr<const Routes> routes=std::make_shared<Routes>();
@@ -222,18 +227,26 @@ void* Routed(void* source,const char* entry="clone") noexcept {
 // provenance on that exact Prefab, without filtering the shared template.
 // Weak sources never retain a Bundle or introduce a resource load.
 std::map<void*,Ref> controlledPrefabSources,pendingControlledClones;
+std::map<void*,std::string> controlledPrefabPaths,pendingControlledClonePaths;
+struct ControlledCloneOwner {Ref root;std::string path;};
+std::map<void*,ControlledCloneOwner> liveControlledClones;
 bool Inherits(void* object,const char* ns,const char* name);
-void ObservePrefabSource(void* source) noexcept {
+void ObservePrefabSource(void* source,const std::string& path={}) noexcept {
  try{
   if(!RuntimeShapes::enabled||!RuntimeShapes::Main()||!RuntimeShapes::Alive(source)||!Inherits(source,"UnityEngine","GameObject"))return;
-  for(auto it=controlledPrefabSources.begin();it!=controlledPrefabSources.end();)if(!it->second.Get())it=controlledPrefabSources.erase(it);else ++it;
+  for(auto it=controlledPrefabSources.begin();it!=controlledPrefabSources.end();)if(!it->second.Get()){controlledPrefabPaths.erase(it->first);it=controlledPrefabSources.erase(it);}else ++it;
+  if(!path.empty())controlledPrefabPaths[source]=path;
   auto known=controlledPrefabSources.find(source);if(known!=controlledPrefabSources.end()&&known->second.Get()==source)return;
   unsigned char inactive=1;void* args[]={RuntimeShapes::api.rendererType,&inactive};
   auto objects=Ref::Make(RuntimeShapes::Call(RuntimeShapes::api.modelRenderers,source,args),false);size_t count=0;
   Require(ArrayLength(objects.Get(),&count),"requested Prefab Renderer array absent");
   for(size_t i=0;i<count;++i){void* renderer=nullptr;Require(CopyRaw((char*)objects.Get()+32+i*sizeof(void*),&renderer,sizeof(renderer)),"requested Prefab Renderer element");
    if(!RuntimeShapes::Alive(renderer)||!RuntimeShapes::RendererKind(renderer))continue;
-   if(RuntimeShapes::Match(renderer,RuntimeShapes::SourceMesh(renderer))){controlledPrefabSources[source]=Ref::Make(source,true);return;}
+    auto mesh=RuntimeShapes::SourceMesh(renderer);bool controlled=RuntimeShapes::Match(renderer,mesh)!=nullptr;
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+    controlled|=!DemandLoadingProbe::ProvenNativeMeshIdentities(mesh).empty();
+#endif
+    if(controlled){controlledPrefabSources[source]=Ref::Make(source,true);return;}
   }
  }catch(const std::exception& e){Log("[CONTROL-RUNTIME-GAP] prefabProvenance=%s",e.what());}catch(...){}
 }
@@ -242,12 +255,16 @@ bool ControlledCloneSource(void* source) noexcept {
   auto found=controlledPrefabSources.find(source);return found!=controlledPrefabSources.end()&&found->second.Get()==source&&RuntimeShapes::Alive(source);
  }catch(...){return false;}
 }
-void* CompleteControlledClone(void* instance,bool controlled) noexcept {
+std::string ControlledSourcePath(void* source){if(!RuntimeShapes::enabled||!RuntimeShapes::Main())return {};auto known=controlledPrefabSources.find(source);if(known==controlledPrefabSources.end()||known->second.Get()!=source)return {};auto found=controlledPrefabPaths.find(source);return found==controlledPrefabPaths.end()?std::string():found->second;}
+void ForgetControlledClone(void* root){liveControlledClones.erase(root);controlledPrefabSources.erase(root);controlledPrefabPaths.erase(root);}
+void* CompleteControlledClone(void* instance,bool controlled,const std::string& path={}) noexcept {
  if(controlled)try{
   if(RuntimeShapes::Alive(instance)&&Inherits(instance,"UnityEngine","GameObject")){
+   auto previous=liveControlledClones.find(instance);bool added=previous==liveControlledClones.end()||previous->second.root.Get()!=instance;
+   liveControlledClones[instance]={Ref::Make(instance,true),path};if(added)++ownerRevision;
+   controlledPrefabSources[instance]=Ref::Make(instance,true);if(!path.empty())controlledPrefabPaths[instance]=path;
    auto ready=RuntimeShapes::RegisterModel(instance);
-   if(ready){controlledPrefabSources[instance]=Ref::Make(instance,true);
-    Log("[CONTROL-RUNTIME-CLONE] instance=%p ready=%zu sharedModState=1 sceneDiscovery=0",instance,ready);}
+   Log("[CONTROL-RUNTIME-CLONE] instance=%p ready=%zu sharedModState=1 sceneDiscovery=0",instance,ready);
   }
  }catch(const std::exception& e){Log("[CONTROL-RUNTIME-GAP] cloneCompletion=%s",e.what());}catch(...){}
  return instance;
@@ -255,23 +272,35 @@ void* CompleteControlledClone(void* instance,bool controlled) noexcept {
 void PollControlledClones() noexcept {
  try{if(!RuntimeShapes::Main()||RuntimeShapes::registrationPaused)return;}catch(...){return;}
  for(auto it=pendingControlledClones.begin();it!=pendingControlledClones.end();){auto current=it++;auto key=current->first;try{
-   auto operation=current->second.Get();if(!operation){pendingControlledClones.erase(key);continue;}
+   auto operation=current->second.Get();if(!operation){pendingControlledClones.erase(key);pendingControlledClonePaths.erase(key);continue;}
    if(!RuntimeShapes::Scalar<unsigned char>(api.cloneDone,operation))continue;
    auto results=Ref::Make(RuntimeShapes::Call(api.cloneResults,operation),false);pendingControlledClones.erase(key);
+   auto path=pendingControlledClonePaths[key];pendingControlledClonePaths.erase(key);
    if(!results.Get())continue;size_t count=0;Require(ArrayLength(results.Get(),&count),"completed clone result array absent");
-   for(size_t i=0;i<count;++i){void* instance=nullptr;Require(CopyRaw((char*)results.Get()+32+i*sizeof(void*),&instance,sizeof(instance)),"completed clone result element");CompleteControlledClone(instance,true);}
-  }catch(const std::exception& e){pendingControlledClones.erase(key);Log("[CONTROL-RUNTIME-GAP] asyncCloneCompletion=%s",e.what());}
-  catch(...){pendingControlledClones.erase(key);}
+   for(size_t i=0;i<count;++i){void* instance=nullptr;Require(CopyRaw((char*)results.Get()+32+i*sizeof(void*),&instance,sizeof(instance)),"completed clone result element");CompleteControlledClone(instance,true,path);}
+  }catch(const std::exception& e){pendingControlledClones.erase(key);pendingControlledClonePaths.erase(key);Log("[CONTROL-RUNTIME-GAP] asyncCloneCompletion=%s",e.what());}
+  catch(...){pendingControlledClones.erase(key);pendingControlledClonePaths.erase(key);}
  }
 }
-void* Clone(void* source){auto routed=Routed(source);auto controlled=ControlledCloneSource(routed);return CompleteControlledClone(originalClone(routed),controlled);}
-void* CloneParent(void* source,void* parent,bool world){auto routed=Routed(source);auto controlled=ControlledCloneSource(routed);return CompleteControlledClone(originalCloneParent(routed,parent,world),controlled);}
-void* Instantiate(void* source,void* position,void* rotation){auto routed=Routed(source,"position");auto controlled=ControlledCloneSource(routed);return CompleteControlledClone(originalInstantiate(routed,position,rotation),controlled);}
-void* InstantiateParent(void* source,void* parent,void* position,void* rotation){auto routed=Routed(source,"parent-position");auto controlled=ControlledCloneSource(routed);return CompleteControlledClone(originalInstantiateParent(routed,parent,position,rotation),controlled);}
-void* InstantiateImmediate(void* source,void* parent,bool world){auto routed=Routed(source,"immediate-parent");auto controlled=ControlledCloneSource(routed);return CompleteControlledClone(originalInstantiateImmediate(routed,parent,world),controlled);}
+void* Clone(void* source){auto routed=Routed(source);auto controlled=ControlledCloneSource(routed);auto path=controlled?ControlledSourcePath(routed):std::string();return CompleteControlledClone(originalClone(routed),controlled,path);}
+void* CloneParent(void* source,void* parent,bool world){auto routed=Routed(source);auto controlled=ControlledCloneSource(routed);auto path=controlled?ControlledSourcePath(routed):std::string();return CompleteControlledClone(originalCloneParent(routed,parent,world),controlled,path);}
+void* Instantiate(void* source,void* position,void* rotation){auto routed=Routed(source,"position");auto controlled=ControlledCloneSource(routed);auto path=controlled?ControlledSourcePath(routed):std::string();return CompleteControlledClone(originalInstantiate(routed,position,rotation),controlled,path);}
+void* InstantiateParent(void* source,void* parent,void* position,void* rotation){auto routed=Routed(source,"parent-position");
+#if defined(EIEM_PREFAB_ROUTE_PROBE)
+ if(proxyContext&&(routed!=source||proxyLogicalPath.find("chr_0028_wulfa_postmodel.prefab")!=std::string::npos)){
+  static std::atomic<unsigned> probeCount{0};if(probeCount.fetch_add(1,std::memory_order_relaxed)<32){
+   auto current=std::atomic_load(&activeNative);bool rootMatched=false;void* candidate=nullptr;
+   if(current&&current->prepared){auto root=current->prepared->rootHashes.find(proxyPathHash);if(root!=current->prepared->rootHashes.end()&&root->second<current->assets.size()){rootMatched=true;candidate=current->assets[root->second].prefab.Get();}}
+   Log("[DIAG-PREFAB-ROUTE] path=%s hash=%016llX source=%p routed=%p proxySource=%p originalSource=%p rootMatched=%d candidate=%p changed=%d",
+    proxyLogicalPath.c_str(),(unsigned long long)proxyPathHash,source,routed,proxySource,proxyOriginalSource,int(rootMatched),candidate,int(source!=routed));
+  }
+ }
+#endif
+ auto controlled=ControlledCloneSource(routed);auto path=controlled?ControlledSourcePath(routed):std::string();return CompleteControlledClone(originalInstantiateParent(routed,parent,position,rotation),controlled,path);}
+void* InstantiateImmediate(void* source,void* parent,bool world){auto routed=Routed(source,"immediate-parent");auto controlled=ControlledCloneSource(routed);auto path=controlled?ControlledSourcePath(routed):std::string();return CompleteControlledClone(originalInstantiateImmediate(routed,parent,world),controlled,path);}
 void* InstantiateAsync(void* source,int count,void* parent,void* position,void* rotation){
  auto routed=Routed(source,"async-parent");auto controlled=ControlledCloneSource(routed);auto operation=originalInstantiateAsync(routed,count,parent,position,rotation);
- if(controlled&&operation)try{pendingControlledClones[operation]=Ref::Make(operation,true);}catch(const std::exception& e){Log("[CONTROL-RUNTIME-GAP] asyncCloneTrack=%s",e.what());}
+ if(controlled&&operation)try{pendingControlledClones[operation]=Ref::Make(operation,true);pendingControlledClonePaths[operation]=ControlledSourcePath(routed);}catch(const std::exception& e){Log("[CONTROL-RUNTIME-GAP] asyncCloneTrack=%s",e.what());}
  return operation;
 }
 void* Call(void* m,void* self=nullptr,void** args=nullptr){return RuntimeShapes::Call(m,self,args);}
@@ -284,17 +313,24 @@ void RememberPrefabProxy(uint64_t hash,void* proxy,void* source){
   if(!known)sources.push_back(Ref::Make(source,true));}
 }
 size_t InvalidatePrefabProxyCache(uint64_t hash,const std::string& path,bool requireObserved,bool logAttempt){
- Require(api.proxyTryUnloadImmediately,"game prefab proxy unload API unavailable");auto found=prefabProxiesByPath.find(hash);
+ Require(api.proxyTryUnloadImmediately&&api.proxyUnloaded,"game prefab proxy unload/state API unavailable");auto found=prefabProxiesByPath.find(hash);
  if(found==prefabProxiesByPath.end()){
   Require(!requireObserved,"affected prefab proxy was not observed before reload: "+path);
   if(logAttempt)Log("[FULL-RELOAD-PREFAB-CACHE] path=%s hash=%016llX proxies=0 unloaded=0 remaining=0 noCachedProxyObserved=1",
     path.c_str(),(unsigned long long)hash);prefabProxySourcesByPath.erase(hash);return 0;
  }
- size_t live=0,unloaded=0;auto& proxies=found->second;
- for(auto it=proxies.begin();it!=proxies.end();){auto proxy=it->Get();if(!proxy){it=proxies.erase(it);continue;}++live;void* args[]={proxy};
+ size_t live=0,unloaded=0,alreadyUnloaded=0;auto& proxies=found->second;
+ for(auto it=proxies.begin();it!=proxies.end();){auto proxy=it->Get();if(!proxy){it=proxies.erase(it);continue;}++live;
+  // TryUnloadImmediately only succeeds for a proxy still in the game's
+  // waiting-unload queue. Clear removes it from that queue before managed GC,
+  // so false does not mean that a historical weak observation still owns it.
+  if(RuntimeShapes::Scalar<unsigned char>(api.proxyUnloaded,proxy)){
+   ++alreadyUnloaded;it=proxies.erase(it);continue;
+  }
+  void* args[]={proxy};
   if(RuntimeShapes::Scalar<unsigned char>(api.proxyTryUnloadImmediately,nullptr,args)){++unloaded;it=proxies.erase(it);}else ++it;}
- if(logAttempt)Log("[FULL-RELOAD-PREFAB-CACHE] path=%s hash=%016llX proxies=%zu unloaded=%zu remaining=%zu",
-   path.c_str(),(unsigned long long)hash,live,unloaded,proxies.size());
+ if(logAttempt)Log("[FULL-RELOAD-PREFAB-CACHE] path=%s hash=%016llX proxies=%zu unloaded=%zu alreadyUnloaded=%zu remaining=%zu",
+   path.c_str(),(unsigned long long)hash,live,unloaded,alreadyUnloaded,proxies.size());
  if(proxies.empty()){prefabProxiesByPath.erase(found);prefabProxySourcesByPath.erase(hash);return unloaded;}
  throw PrefabProxyRetainedError("game retained an affected prefab proxy; refusing stale-resource reload: "+path);
 }
@@ -602,6 +638,7 @@ void PartReleased(void* self,void* info){ObservePartReleased(self,info,originalP
 void ComplexPartReleased(void* self,void* info){ObservePartReleased(self,info,originalComplexPartReleased);}
 std::vector<Ref> Components(void* root);
 #include "eiem_entry_ui_models.h"
+#include "eiem_entry_ui_weapon_dependencies.h"
 bool RootContains(void* parentRoot,void* childRoot){
  if(parentRoot==childRoot)return true;if(!RuntimeShapes::Alive(parentRoot)||!RuntimeShapes::Alive(childRoot))return false;
  auto parent=Ref::Make(Call(api.goTransform,parentRoot),false),child=Ref::Make(Call(api.goTransform,childRoot),false);
@@ -903,6 +940,9 @@ void ProxyPreload(void* self,bool asynchronous,void* info){
    // create-before-initialize route.
    auto source=originalProxyGet?originalProxyGet(asset):Call(api.proxyGet,asset);
    if(Inherits(source,"UnityEngine","GameObject")&&RuntimeShapes::Alive(source)){auto path=ProxyLogicalPath(asset);
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+      DemandLoadingProbe::ObserveNativeMeshSource(source,path);
+#endif
      if(!path.empty()){
      auto before=source;source=EffectDebug::RouteReplacement(path,source);proxyOriginalSource=before;if(before!=source)scope.originalHeld=Ref::Make(before,false);
      }
@@ -932,6 +972,9 @@ void* ResourceGet(void* self,void* info){
   // define every eligible target; no name guessing or scene traversal.
   auto path=NormalizeAssetPath(String(Call(api.handlePath,self)));
   if(!Inherits(source,"UnityEngine","GameObject"))return source;
+#if defined(EIEM_DEMAND_NATIVE_ACCEPTANCE)
+   DemandLoadingProbe::ObserveNativeMeshSource(source,path);
+#endif
   auto current=std::atomic_load(&activeNative);
   auto rules=std::atomic_load(&resourceRules);const Plan* plan=current?current->prepared->plan.get():rules?rules->plan.get():nullptr;
   const bool planned=plan&&FindRoot(*plan,path);
@@ -993,9 +1036,7 @@ RuntimeControls::State CompiledControls(const std::shared_ptr<const std::vector<
 RuntimeControls::State CompiledRuntimeControls(const std::shared_ptr<const std::vector<Package>>& graph,
     const Plan& plan,const EiemGlobalConfig& config,
     const std::shared_ptr<const DemandLoadingProbe::InstalledGeneration>& demandGeneration){
- auto state=CompiledControls(graph,plan,config);
- RuntimeControls::AppendPackages(state,DemandLoadingProbe::StandalonePackages(demandGeneration),config);
- return state;
+ return CompiledControls(RuntimeControls::InstalledGraph(graph,DemandLoadingProbe::StandalonePackages(demandGeneration)),plan,config);
 }
 struct PackagePayload {
  std::map<const Resource*,uint64_t> resources;
@@ -1116,7 +1157,8 @@ void Install(void** assemblies,size_t count){
   auto resultType=il2cpp_type_get_name(il2cpp_method_get_return_type(api.proxyTryUnloadImmediately));
   bool returnsBoolean=resultType&&!strcmp(resultType,"System.Boolean");if(resultType)il2cpp_free((void*)resultType);
   Require(returnsBoolean,"game TryUnloadImmediately return type differs from Boolean");
-  Log("[FULL-RELOAD-PREFAB-CACHE-API] method=PrefabInstantiateProxyManager.TryUnloadImmediately static=1 parameter=PrefabInstantiateProxy return=Boolean");
+  api.proxyUnloaded=Method(proxy,"get_isUnloaded",{},"System.Boolean",false);
+  Log("[FULL-RELOAD-PREFAB-CACHE-API] method=PrefabInstantiateProxyManager.TryUnloadImmediately static=1 parameter=PrefabInstantiateProxy return=Boolean state=PrefabInstantiateProxy.get_isUnloaded");
   Require(Entry::Install(proxy,"_PreloadPrefab",{"System.Boolean"},"System.Void",false,(void*)ProxyPreload,(void**)&originalProxyPreload),"game prefab instantiate lifecycle hook unavailable");
   api.rootCategory=Enum(FindClass("Beyond.Resource","RootCategory",assemblies,count),"Main");api.priority=Enum(FindClass("Beyond.Resource","EResourceRequestPriority",assemblies,count),"Default");
   auto go=FindClass("UnityEngine","GameObject",assemblies,count),renderer=FindClass("UnityEngine","Renderer",assemblies,count);
@@ -1219,6 +1261,7 @@ void Install(void** assemblies,size_t count){
 #endif
   api.childCount=Method(transform,"get_childCount",{},"System.Int32",false);api.getChild=Method(transform,"GetChild",{"System.Int32"},"UnityEngine.Transform",false);
   api.directComponents=Method(go,"GetComponents",{"System.Type"},"UnityEngine.Component[]",false);
+  BindUIWeaponDependencies(FindClass("Beyond.Gameplay.View","CharUIModelMono",assemblies,count));
   for(auto m:{api.toPath,api.load,api.done,api.error,api.get,api.dispose,api.components,api.goTransform,api.materials,api.texture,api.shader,api.width,api.height,api.mips,api.modelCom,api.released,api.getModel,api.getPath,api.remove,api.loadModel,api.instance,api.discard,api.follow,api.instanceId,api.isChild,api.parent,api.childCount,api.getChild,api.componentGo,api.directComponents})Require(m,"reload exact managed signature missing");
   Require(Method(object,"Internal_CloneSingle",{"UnityEngine.Object"},"UnityEngine.Object",true)&&Method(object,"Internal_CloneSingleWithParent",{"UnityEngine.Object","UnityEngine.Transform","System.Boolean"},"UnityEngine.Object",true),"reload prefab clone signatures absent");
   Require(LoadingObservation::Hook("UnityEngine.Object::Internal_CloneSingle(UnityEngine.Object)",(void*)Clone,(void**)&originalClone)&&LoadingObservation::Hook("UnityEngine.Object::Internal_CloneSingleWithParent(UnityEngine.Object,UnityEngine.Transform,System.Boolean)",(void*)CloneParent,(void**)&originalCloneParent),"reload registered prefab clone bindings absent");

@@ -2,6 +2,7 @@
 #include "static_mesh_assembly_smoke.cpp"
 #undef main
 #include "../../src/eiem_native_random_access.h"
+#include "../../src/eiem_demand_target_lookup.h"
 #include "../../src/eiem_native_serialized_splice.h"
 #include "../../src/eiem_mesh_target_directory.h"
 #include "../../src/eiem_demand_mesh_preparation.h"
@@ -47,6 +48,91 @@ void ExactContainerPreloads() {
   SetInteger(fixture.T(300),Child(fixture.T(300),info,"preloadIndex"),uint64_t(-1));
   RejectRead([&]{inspect("assets/a.prefab");},"negative container preload index");
   std::cout<<"PASS exact container preload ownership, same-name prefab isolation, duplicate references and invalid ranges\n";
+}
+void SharedTargetInspection(){
+  Fixture fixture;fixture.SetList(300,"m_PreloadTable",{100,100});
+  auto& preload=ArrayValue(fixture.T(300),Child(fixture.T(300),fixture.V(300),"m_PreloadTable"));
+  SetReference(fixture.T(300),preload.children.back(),{"unity_builtin_extra",101},fixture.refs,fixture.cab);
+  auto& rows=ArrayValue(fixture.T(300),Child(fixture.T(300),fixture.V(300),"m_Container"));
+  for(auto& row:rows.children){auto& info=Child(fixture.T(300),row,"second");SetInteger(fixture.T(300),Child(fixture.T(300),info,"preloadIndex"),0);SetInteger(fixture.T(300),Child(fixture.T(300),info,"preloadSize"),2);}
+  auto input=EndfieldInput::Encode(EiemAuthorMeshBundle::EnvelopeHeader(),{{fixture.cab,4,fixture.BytesOf()}});R::Limits limits;limits.cacheBytes=0;
+  R::Reader reader(input.size(),[&](size_t at,unsigned char* out,size_t n){std::memcpy(out,input.data()+at,n);},limits);
+  EiemDemandTargetLookup::Inspection inspection;
+  for(unsigned i=0;i<325;++i){Require(inspection.Find(reader,{"assets/missing"+std::to_string(i),"Mesh"},[](const auto&,const auto&,auto&){return false;}).empty(),"missing target gained unrelated Mesh");if(!i)limits.readBytes=reader.stats.encodedBytes;}
+  // No extra encoded reads for another missing path, even with no decoded cache.
+  Require(reader.stats.encodedBytes==limits.readBytes,"multi-target discovery reread native container fields");
+  auto target=inspection.Find(reader,{"assets/a.prefab","Static"},[](const auto&,const auto&,auto&)->bool{
+    throw std::runtime_error("engine preload was treated as a game Mesh dependency");});
+  Require(!target.empty(),"preload Mesh target missing after absent queries");
+  auto bytes=reader.stats.encodedBytes;
+  auto again=inspection.Find(reader,{"assets/a.prefab","Static"},[](const auto&,const auto&,auto&){return false;});
+  Require(again.size()==target.size()&&reader.stats.encodedBytes==bytes,"positive target reread preload table or Mesh name");
+  Require(inspection.Find(reader,{"assets/a.prefab","WrongName"},[](const auto&,const auto&,auto&){return false;}).empty(),"cached Mesh bypassed requested asset identity");
+  Fixture external;external.cab="CAB-external";
+  auto nativeExternal=EndfieldInput::Encode(EiemAuthorMeshBundle::EnvelopeHeader(),{{external.cab,4,external.BytesOf()}});
+  R::Reader second(nativeExternal.size(),[&](size_t at,unsigned char* out,size_t n){std::memcpy(out,nativeExternal.data()+at,n);});
+  Fixture carrier;
+  auto& entries=ArrayValue(carrier.T(300),Child(carrier.T(300),carrier.V(300),"m_Container"));
+  auto& info=Child(carrier.T(300),entries.children.back(),"second");
+  SetReference(carrier.T(300),Child(carrier.T(300),info,"asset"),{external.cab,100},carrier.refs,carrier.cab);
+  SetInteger(carrier.T(300),Child(carrier.T(300),info,"preloadSize"),0);
+  auto nativeCarrier=EndfieldInput::Encode(EiemAuthorMeshBundle::EnvelopeHeader(),{{carrier.cab,4,carrier.BytesOf()}});
+  R::Reader first(nativeCarrier.size(),[&](size_t at,unsigned char* out,size_t n){std::memcpy(out,nativeCarrier.data()+at,n);});
+  EiemDemandTargetLookup::Inspection across;
+  auto resolve=[&](const NativeReference& ref,const Identity& identity,Asset& asset){return across.ReferencedMesh(second,ref,identity,asset);};
+  auto externalMesh=across.Find(first,{"assets/static.mesh","Static"},resolve);
+  Require(externalMesh.size()==1&&externalMesh[0].cab==external.cab,"cross-input direct container Mesh resolved to wrong same-name local Mesh");
+  Require(across.Find(first,{"assets/static.mesh","Different"},resolve).empty(),"external object cache ignored target name");
+  std::cout<<"PASS request-local target inspection: 325 absent paths, positive preload Mesh, repeated positive/name separation and no container rereads\n";
+}
+void MeshSourceReachability(){
+ Fixture fixture;
+ {
+  auto local=EndfieldInput::Encode(EiemAuthorMeshBundle::EnvelopeHeader(),{{fixture.cab,4,fixture.BytesOf()}});
+  auto read=[&](size_t at,unsigned char* out,size_t size){memcpy(out,local.data()+at,size);};
+  R::Limits limits;limits.cacheBytes=0;
+  R::Reader baseline(local.size(),read,limits);
+  Require(baseline.Layout(baseline.directory.members.front()).externals.empty(),"local Mesh fixture has external references");
+  R::Reader reader(local.size(),read,limits);EiemDemandTargetLookup::Inspection inspection;
+  Require(inspection.MeshSources(reader).empty()&&reader.stats.encodedBytes==baseline.stats.encodedBytes,
+    "Mesh source search read object fields in a fully local serialized member");
+ }
+ SetReference(fixture.T(12),Child(fixture.T(12),fixture.V(12),"m_Mesh"),{"CAB-static-mesh",100},fixture.refs,fixture.cab);
+ auto skin=fixture.types.size();fixture.types.push_back(Schema(137,{Ref("m_Mesh")}));fixture.Add(40,skin);
+ SetReference(fixture.T(40),Child(fixture.T(40),fixture.V(40),"m_Mesh"),{"CAB-skin-mesh",101},fixture.refs,fixture.cab);
+ auto& children=ArrayValue(fixture.T(11),Child(fixture.T(11),fixture.V(11),"m_Children"));
+ auto child=ArrayElement(fixture.T(11),children);SetReference(fixture.T(11),child,{"CAB-child",21},fixture.refs,fixture.cab);children.children={child};children.count=1;
+ auto nested=fixture.types.size();fixture.types.push_back(Schema(1001,{Ref("m_SourcePrefab")}));fixture.Add(41,nested);
+ SetReference(fixture.T(41),Child(fixture.T(41),fixture.V(41),"m_SourcePrefab"),{"CAB-prefab",10},fixture.refs,fixture.cab);
+ auto unknown=fixture.types.size();fixture.types.push_back(Schema(114,{Ref("customMeshOwner")}));fixture.Add(42,unknown);
+ SetReference(fixture.T(42),Child(fixture.T(42),fixture.V(42),"customMeshOwner"),{"CAB-custom",15},fixture.refs,fixture.cab);
+ fixture.Add(44,unknown);fixture.Add(45,unknown);
+ SetReference(fixture.T(44),Child(fixture.T(44),fixture.V(44),"customMeshOwner"),{"unity default resources",100},fixture.refs,fixture.cab);
+ SetReference(fixture.T(45),Child(fixture.T(45),fixture.V(45),"customMeshOwner"),{"unity_builtin_extra",101},fixture.refs,fixture.cab);
+ // Typed terminal pointers and even generic pointers inside a Material cannot
+ // turn unrelated texture/shader dependency closures into Mesh searches.
+ auto materialRef=Ref("material");materialRef.type="PPtr<Material>";
+ auto typed=fixture.types.size();fixture.types.push_back(Schema(23,{materialRef}));fixture.Add(43,typed);
+ SetReference(fixture.T(43),Child(fixture.T(43),fixture.V(43),"material"),{"CAB-material",200},fixture.refs,fixture.cab);
+ fixture.types[6]=Schema(21,{Ref("texture")});fixture.objects.erase(200);fixture.Add(200,6);
+ SetReference(fixture.T(200),Child(fixture.T(200),fixture.V(200),"texture"),{"CAB-texture",201},fixture.refs,fixture.cab);
+ auto& preloads=ArrayValue(fixture.T(300),Child(fixture.T(300),fixture.V(300),"m_PreloadTable"));
+ auto unused=ArrayElement(fixture.T(300),preloads);SetReference(fixture.T(300),unused,{"CAB-unused-preload",55},fixture.refs,fixture.cab);preloads.children.push_back(unused);preloads.count=preloads.children.size();
+ auto input=EndfieldInput::Encode(EiemAuthorMeshBundle::EnvelopeHeader(),{{fixture.cab,4,fixture.BytesOf()}});R::Limits limits;limits.cacheBytes=0;
+ R::Reader reader(input.size(),[&](size_t at,unsigned char* out,size_t size){memcpy(out,input.data()+at,size);},limits);
+ EiemDemandTargetLookup::Inspection inspection;
+ auto links=inspection.MeshSources(reader);
+ Require(links==std::set<std::string>{"CAB-static-mesh","CAB-skin-mesh","CAB-child","CAB-prefab","CAB-custom"},
+   "Mesh source traversal lost structural/custom references or followed terminal/unrelated preload resources");
+ auto bytes=reader.stats.encodedBytes;Require(inspection.MeshSources(reader)==links&&reader.stats.encodedBytes==bytes,"Mesh source links reread serialized fields");
+ // An external logical container is itself proof of a structural source even
+ // when there is no local Renderer in this wrapper input.
+ auto& rows=ArrayValue(fixture.T(300),Child(fixture.T(300),fixture.V(300),"m_Container"));
+ SetReference(fixture.T(300),Child(fixture.T(300),Child(fixture.T(300),rows.children[0],"second"),"asset"),{"CAB-external-root",10},fixture.refs,fixture.cab);
+ auto wrapper=EndfieldInput::Encode(EiemAuthorMeshBundle::EnvelopeHeader(),{{fixture.cab,4,fixture.BytesOf()}});
+ R::Reader second(wrapper.size(),[&](size_t at,unsigned char* out,size_t size){memcpy(out,wrapper.data()+at,size);});
+ EiemDemandTargetLookup::Inspection fresh;Require(fresh.MeshSources(second).count("CAB-external-root"),"external container root omitted from Mesh traversal");
+ std::cout<<"PASS Mesh source reachability: static/skinned Mesh, external hierarchy, nested Prefab, unknown component, terminal resources, unrelated preloads and no rereads\n";
 }
 void EmbeddedMaterialClosure() {
   Fixture fixture;fixture.types[6]=Schema(21,{{"string","m_Name",{}},Ref("m_Shader"),
@@ -439,6 +525,24 @@ void PreloadIntervals() {
   auto& main=Child(type,bundle,"m_MainAsset");SetInteger(type,Child(type,main,"preloadIndex"),6);SetInteger(type,Child(type,main,"preloadSize"),0);
   auto raw=f.BytesOf();auto layout=ParseSerialized(raw);Require(layout.externals==f.refs.externals,"fixture lost cross-CAB references");
   const auto originalExternals=layout.externals;std::set<NativeReference> referenced;NativePreloadExpansion expansion{{anchor,{a,b,local,local,anchor}}};
+  auto orderedBundle=bundle;
+  auto orderedLayout=layout;
+  Require(ExpandNativePreloads(type,orderedBundle,orderedLayout,f.cab,expansion,referenced,NativePreloadPlacement::BeforeAnchor),
+    "native preload prerequisites were not inserted");
+  const auto& ordered=ConstArray(type,Child(type,orderedBundle,"m_PreloadTable"));
+  for(const auto& entry:ConstArray(type,Child(type,orderedBundle,"m_Container")).children){
+    const auto& info=Child(type,entry,"second");
+    const auto first=Integer(Child(type,info,"preloadIndex")),count=Integer(Child(type,info,"preloadSize"));
+    std::set<NativeReference> seen;
+    for(size_t i=first;i<first+count;++i){
+      const auto current=NullableReference(type,ordered.children.at(i),orderedLayout,f.cab);
+      if(current==anchor)Require(seen.count(a)&&seen.count(b)&&seen.count(local),"preload prerequisite appears after its anchor");
+      seen.insert(current);
+    }
+  }
+  auto orderedBytes=EncodeValue(type,orderedBundle);
+  Require(!ExpandNativePreloads(type,orderedBundle,orderedLayout,f.cab,expansion,referenced,NativePreloadPlacement::BeforeAnchor)&&
+    orderedBytes==EncodeValue(type,orderedBundle),"native preload prerequisite replay grew the table");
   Require(ExpandNativePreloads(type,bundle,layout,f.cab,expansion,referenced)&&referenced==std::set<NativeReference>{anchor},"native preload expansion missed repeated anchor");
   const auto& output=ConstArray(type,Child(type,bundle,"m_PreloadTable"));
   for(size_t i=0;i<ranges.size();++i){const auto& info=Child(type,container.children[i],"second");auto first=Integer(Child(type,info,"preloadIndex")),count=Integer(Child(type,info,"preloadSize"));
@@ -521,6 +625,11 @@ void NativeCatalogAssembly() {
     Require(carrier.parts.size()==count&&carrier.addedObjects==(count?count-1:0)&&catalog->OpenMeshes()==count,"native 0/1/N carrier resource count differs");
     if(count){auto first=catalog->GetMesh("PartP0");Require(first->metadataReadBytes<64*1024&&first->object.size>1024*1024,"native metadata read includes authored vertex payload");
       std::vector<std::thread> threads;std::atomic<bool> same{true};for(size_t i=0;i<4;++i)threads.emplace_back([&]{if(catalog->GetMesh("PartP0")!=first)same=false;});for(auto& thread:threads)thread.join();Require(same,"concurrent author asset requests duplicated a native input");}
+    if(count){std::ostringstream aliases;aliases<<ini.str()<<"\n[PartAlias]\nmesh=MeshP0\nmaterial_slot=2\nvisible=1\n";
+      // A second assembly name must reuse author geometry without rewriting it.
+      auto text=aliases.str();{std::ofstream out(folder/"mod.ini",std::ios::binary|std::ios::trunc);out<<text;}
+      EiemDemandAuthorResources::Catalog aliasesCatalog(folder);auto originalMesh=aliasesCatalog.GetMesh("PartP0");auto aliasMesh=aliasesCatalog.GetMesh("PartAlias");
+      Require(aliasMesh->declaration.part=="PartAlias"&&aliasMesh->declaration.materialSlot==2&&aliasMesh->declaration.material.empty()&&aliasMesh->object.size==originalMesh->object.size,"Mesh resource could not be independently assembled by multiple Part names");}
     // Reopen the carrier VIEW, without serializing a temporary complete input.
     auto viewRead=[view](size_t at,unsigned char* out,size_t n){Require(view->ReadAt(at,out,n)==n,"carrier view read truncated");};R::Reader consumer(view->Size(),viewRead);auto updated=consumer.Layout(consumer.directory.members[0]);
     auto built=N::PrepareConsumer(consumer,0,updated,author,targets,carrier.parts);auto output=S::BuildRanges(consumer,{built.plan.rewrite});auto actual=EndfieldInput::Decode(Materialize(output.Bind(viewRead)));auto after=ParseSerialized(actual.members[0].bytes);
@@ -529,7 +638,7 @@ void NativeCatalogAssembly() {
     EiemNativeEditTransaction::Member transaction(current,0,layout);
     auto stagedCarrier=N::StageCarrier(transaction,current,0,author,targets);
     if(count){auto projected=transaction.Project(100,{"m_Name"});
-      Require(Text(Child(mt,projected,"m_Name").raw.data(),Child(mt,projected,"m_Name").raw.size())=="native-P0","range overlay projection returned the old Mesh");
+      Require(Text(Child(mt,projected,"m_Name").raw.data(),Child(mt,projected,"m_Name").raw.size())==RuntimePartName(author.package,"PartP0",targets.begin()->first),"range overlay projection returned the old Mesh");
       auto bounded=current.limits.fieldBytes;current.limits.fieldBytes=1024;
       Rejected([&]{transaction.Object(100);});current.limits.fieldBytes=bounded;
     }
@@ -582,9 +691,11 @@ void NativeCatalogAssembly() {
       auto variant201=EncodeValue(layout.types.at(materialType),variants.Object(201));
       variants.Stage(variants.Layout(),{},{{210,materialType,std::move(variant200)},{211,materialType,std::move(variant201)}});
       RendererMaterialReferences references;MaterialPreloadIndex closures;
+      const NativeReference sharedShader{"CAB-shared-shader", 700};
       for(const auto& part:variantCarrier.parts)for(auto sourceRenderer:{int64_t(13),int64_t(23)}){
         NativeReference selected{fixture.cab,sourceRenderer==13?210:211};
-        references.emplace(RendererMaterialKey{sourceRenderer,part.part},selected);closures[selected].insert(selected);
+        references.emplace(RendererMaterialKey{sourceRenderer,part.part},selected);
+        closures[selected].insert({selected, sharedShader, {fixture.cab, 200}});
       }
       auto assembled=N::StageConsumer(variants,author,targets,variantCarrier.parts,&references,&closures);
       auto variantView=S::BuildRanges(current,{variants.Commit().rewrite}).Bind(read);Bytes bytes(variantView->Size());
@@ -598,7 +709,7 @@ void NativeCatalogAssembly() {
           "per-Renderer material variant crossed source donor: source="+std::to_string(part.sourceRenderer)+" actual="+
           std::to_string(NullableReference(type,materials.children.front(),variantLayout,fixture.cab).second)+" expected="+std::to_string(expected));
       }
-      std::set<NativeReference> preloadReferences;bool foundBundle=false;
+      std::multiset<NativeReference> preloadReferences;bool foundBundle=false;
       for(auto id:variantLayout.order){const auto& type=variantLayout.types.at(variantLayout.objects.at(id).type);if(type.classId!=142)continue;
         foundBundle=true;auto bundle=ObjectValue(result.members[0].bytes,variantLayout,id);
         for(const auto& reference:ConstArray(type,Child(type,bundle,"m_PreloadTable")).children)
@@ -606,6 +717,13 @@ void NativeCatalogAssembly() {
       }
       Require(foundBundle&&preloadReferences.count({fixture.cab,210})&&preloadReferences.count({fixture.cab,211}),
         "per-Renderer Material variants are absent from native preload closure");
+      Require(preloadReferences.count(sharedShader)==1&&preloadReferences.count({fixture.cab,200})==1&&
+          preloadReferences.count({fixture.cab,100})==1,
+        "shared or already-preloaded Renderer dependencies were appended again");
+      for (const auto& part : assembled.result.parts) {
+        for (auto id : {part.renderer, part.owner, part.transform, part.mesh})
+          Require(preloadReferences.count({fixture.cab,id})==1,"multi-Mesh Renderer preload is missing or duplicated");
+      }
     }
   }
   std::cout<<"PASS native catalog/assembly: lazy file metadata, 0/1/N shared Meshes, two Prefab roots, original per-renderer Materials, LOD/helper/preload expansion and concurrent asset deduplication\n";
@@ -614,10 +732,21 @@ void RetainedSourceLease() {
   auto folder=std::filesystem::temp_directory_path()/("eff-demand-source-lease-"+std::to_string(GetCurrentProcessId()));Require(!std::filesystem::exists(folder),"source lease fixture directory exists");std::filesystem::create_directory(folder);
   auto path=folder/"source.bundle",retired=folder/"retired.bundle";Bytes data(4096);for(size_t i=0;i<data.size();++i)data[i]=static_cast<unsigned char>(i&255);
   auto input=Bundle(data,"lease");{std::ofstream out(path,std::ios::binary);out.write(reinterpret_cast<const char*>(input.data()),input.size());}
+  constexpr size_t fileOffset=17, rangeOffset=23, rangeBytes=101;
+  std::unique_ptr<R::File> snapshot;
+  {
+    R::File file(path,fileOffset);
+    Rejected([&]{file.SnapshotRange(file.Size()-1,2);});
+    snapshot=file.SnapshotRange(rangeOffset,rangeBytes);
+    Require(!file.SnapshotBytes()&&snapshot->Size()==rangeBytes&&snapshot->SnapshotBytes()==rangeBytes,
+      "native author range copied bytes outside the leased range");
+  }
   std::shared_ptr<const EiemInputSpanView::View> view;std::weak_ptr<R::File> weak;
   {auto file=std::make_shared<R::File>(path,0);weak=file;auto read=[file](size_t at,unsigned char* out,size_t n){file->ReadAt(at,out,n);};R::Reader reader(file->Size(),read);auto prepared=S::Build(reader,{});view=prepared.Bind(read);}
   Require(!weak.expired(),"native view lost its source lease after preparation");
   std::filesystem::rename(path,retired);{std::ofstream out(path,std::ios::binary);out<<"new generation";}std::filesystem::remove(retired);
+  Bytes copied(rangeBytes);snapshot->ReadAt(0,copied.data(),copied.size());
+  Require(std::equal(copied.begin(),copied.end(),input.begin()+fileOffset+rangeOffset),"native author snapshot lost the original subrange");
   std::atomic<bool> correct{true};std::vector<std::thread> threads;
   for(size_t ti=0;ti<4;++ti)threads.emplace_back([&,ti]{try{EiemInputSpanView::Cursor cursor(view);for(size_t k=0;k<40;++k){auto at=(ti*977+k*67)%(input.size()-64);cursor.Seek(int64_t(at),0);Bytes bytes(64);Require(cursor.Read(bytes.data(),bytes.size())==bytes.size(),"retained source short read");if(!std::equal(bytes.begin(),bytes.end(),input.begin()+at))correct=false;}}catch(...){correct=false;}});
   for(auto& thread:threads)thread.join();Require(correct,"concurrent streams reopened the changed path or lost source position isolation");
@@ -773,5 +902,5 @@ void RealInputs(const std::filesystem::path& game,const std::filesystem::path& m
   }
   Require(count,"no real input fixtures inspected");
 }
-int main(int argc,char** argv) {try{if(argc==8&&std::string(argv[1])=="--native-author-observed"){InspectNativeAuthor(std::filesystem::u8path(argv[2]),std::stoull(argv[3]),std::filesystem::u8path(argv[6]),argv[7],std::filesystem::u8path(argv[4]),std::stoull(argv[5]));return 0;}if(argc==4&&std::string(argv[1])=="--inspect"){InspectObserved(std::filesystem::u8path(argv[2]),std::stoull(argv[3]));return 0;}if(argc==6&&std::string(argv[1])=="--author-observed"){InspectAuthorObserved(std::filesystem::u8path(argv[2]),std::stoull(argv[3]),std::filesystem::u8path(argv[4]),argv[5]);return 0;}if(argc==8&&std::string(argv[1])=="--author-consumer-observed"){InspectAuthorObserved(std::filesystem::u8path(argv[2]),std::stoull(argv[3]),std::filesystem::u8path(argv[6]),argv[7],std::filesystem::u8path(argv[4]),std::stoull(argv[5]));return 0;}ExactContainerPreloads();EmbeddedMaterialClosure();SparseInput();CompressedRanges();CutsceneHierarchyReadOrder();CompressedDecodedView();SpliceCompressed();SpliceMetadata();SpliceSparse();SpliceDifferential();SerializedPlanDifferential();SerializedPlanSparse();ProjectedRendererAssembly();StreamedAuthorGraft();PreloadIntervals();NativeCatalogAssembly();RetainedSourceLease();if(argc==3)RealInputs(std::filesystem::u8path(argv[1]),std::filesystem::u8path(argv[2]));else Require(argc==1,"usage: native_random_access_smoke [game mod]");std::cout<<"PASS native random access; no author payloads or native game objects created\n";return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}
+int main(int argc,char** argv) {try{if(argc==8&&std::string(argv[1])=="--native-author-observed"){InspectNativeAuthor(std::filesystem::u8path(argv[2]),std::stoull(argv[3]),std::filesystem::u8path(argv[6]),argv[7],std::filesystem::u8path(argv[4]),std::stoull(argv[5]));return 0;}if(argc==4&&std::string(argv[1])=="--inspect"){InspectObserved(std::filesystem::u8path(argv[2]),std::stoull(argv[3]));return 0;}if(argc==6&&std::string(argv[1])=="--author-observed"){InspectAuthorObserved(std::filesystem::u8path(argv[2]),std::stoull(argv[3]),std::filesystem::u8path(argv[4]),argv[5]);return 0;}if(argc==8&&std::string(argv[1])=="--author-consumer-observed"){InspectAuthorObserved(std::filesystem::u8path(argv[2]),std::stoull(argv[3]),std::filesystem::u8path(argv[6]),argv[7],std::filesystem::u8path(argv[4]),std::stoull(argv[5]));return 0;}ExactContainerPreloads();SharedTargetInspection();MeshSourceReachability();EmbeddedMaterialClosure();SparseInput();CompressedRanges();CutsceneHierarchyReadOrder();CompressedDecodedView();SpliceCompressed();SpliceMetadata();SpliceSparse();SpliceDifferential();SerializedPlanDifferential();SerializedPlanSparse();ProjectedRendererAssembly();StreamedAuthorGraft();PreloadIntervals();NativeCatalogAssembly();RetainedSourceLease();if(argc==3)RealInputs(std::filesystem::u8path(argv[1]),std::filesystem::u8path(argv[2]));else Require(argc==1,"usage: native_random_access_smoke [game mod]");std::cout<<"PASS native random access; no author payloads or native game objects created\n";return 0;}catch(const std::exception& e){std::cerr<<"FAIL "<<e.what()<<'\n';return 1;}}
 

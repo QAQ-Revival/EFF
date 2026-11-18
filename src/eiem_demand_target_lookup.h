@@ -11,111 +11,128 @@ using namespace EiemNativeInput;
 // unresolved targets share parsed metadata; no cache crosses a generation or
 // retains the game's inputs after dependency preparation.
 class Inspection {
- struct ContainerRow {
-  std::string cab;
-  int64_t pathId = 0;
-  bool external = false;
- };
- struct MemberIndex {
+ struct Member {
   SerializedLayout layout;
-  std::multimap<std::string, ContainerRow> rowsByPath;
-  std::multimap<std::string, std::pair<size_t, size_t>> preloadRangesByPath;
-  int64_t bundleObjectId = 0;
-  bool preloadsLoaded = false;
-  std::vector<NativeReference> preloadTable;
+  bool hasContainers=false;
+  std::map<std::string,std::vector<EiemNativeRandomAccess::Reader::ContainerEntry>> containers;
+  std::map<int64_t,std::vector<NativeReference>> preloads;
+  std::map<int64_t,Asset> meshes;
+  bool hasMeshSources=false;
+  std::set<std::string> meshSources;
  };
- std::map<EiemNativeRandomAccess::Reader*, std::map<size_t, MemberIndex>> members_;
- MemberIndex& Index(EiemNativeRandomAccess::Reader& reader, const EiemNativeViewWriter::Member& member) {
-  auto& byOffset = members_[&reader];
-  auto found = byOffset.find(member.offset);
-  if (found != byOffset.end()) return found->second;
-  MemberIndex index;
-  index.layout = reader.Layout(member);
-  for (auto id : index.layout.order) {
-   const auto& type = index.layout.types.at(index.layout.objects.at(id).type);
-   if (type.classId != 142) continue;
-   index.bundleObjectId = id;
-   auto fields = reader.Fields(member, index.layout, id, {"m_Container"});
-   for (const auto& row : ArrayValue(type, fields.at("m_Container")).children) {
-    const auto& key = Child(type, row, "first");
-    const auto& info = Child(type, row, "second");
-    const auto& ptr = Child(type, info, "asset");
-    auto file = Integer(Child(type, ptr, "m_FileID"));
-    Require(file <= index.layout.externals.size(), "native container external index differs");
-    auto logical = Text(key.raw.data(), key.raw.size());
-    std::transform(logical.begin(), logical.end(), logical.begin(),
-                   [](unsigned char c) { return char(std::tolower(c)); });
-    ContainerRow entry;
-    entry.cab = file ? index.layout.externals[size_t(file) - 1] : member.name;
-    entry.pathId = int64_t(Integer(Child(type, ptr, "m_PathID")));
-    entry.external = file != 0;
-    index.rowsByPath.emplace(logical, std::move(entry));
-    index.preloadRangesByPath.emplace(
-        std::move(logical),
-        std::make_pair(size_t(Integer(Child(type, info, "preloadIndex"))),
-                       size_t(Integer(Child(type, info, "preloadSize")))));
-   }
-   break;
-  }
-  return byOffset.emplace(member.offset, std::move(index)).first->second;
+ std::map<EiemNativeRandomAccess::Reader*,std::map<size_t,Member>> layouts_;
+ Member& Metadata(EiemNativeRandomAccess::Reader& reader,const EiemNativeViewWriter::Member& member){
+  auto& layouts=layouts_[&reader];auto found=layouts.find(member.offset);
+  if(found==layouts.end()){Member value;value.layout=reader.Layout(member);found=layouts.emplace(member.offset,std::move(value)).first;}
+  return found->second;
  }
- const std::vector<NativeReference>& PreloadTable(EiemNativeRandomAccess::Reader& reader,
-                                                  const EiemNativeViewWriter::Member& member,
-                                                  MemberIndex& index) {
-  if (index.preloadsLoaded || !index.bundleObjectId) return index.preloadTable;
-  index.preloadsLoaded = true;
-  const auto& type = index.layout.types.at(index.layout.objects.at(index.bundleObjectId).type);
-  auto preloads = reader.Fields(member, index.layout, index.bundleObjectId, {"m_PreloadTable"});
-  const auto& values = ArrayValue(type, preloads.at("m_PreloadTable")).children;
-  index.preloadTable.reserve(values.size());
-  for (const auto& pointer : values) {
-   auto file = Integer(Child(type, pointer, "m_FileID"));
-   Require(file <= index.layout.externals.size(), "native container preload external index differs");
-   auto object = int64_t(Integer(Child(type, pointer, "m_PathID")));
-   index.preloadTable.emplace_back(file ? index.layout.externals[size_t(file) - 1] : member.name, object);
+ const SerializedLayout& Layout(EiemNativeRandomAccess::Reader& reader,const EiemNativeViewWriter::Member& member){
+  return Metadata(reader,member).layout;
+ }
+ const std::map<std::string,std::vector<EiemNativeRandomAccess::Reader::ContainerEntry>>& Containers(
+     EiemNativeRandomAccess::Reader& reader,const EiemNativeViewWriter::Member& member){
+  auto& metadata=Metadata(reader,member);
+  if(!metadata.hasContainers){std::map<std::string,std::vector<EiemNativeRandomAccess::Reader::ContainerEntry>> rows;
+   for(auto& entry:reader.Containers(member,metadata.layout))rows[entry.asset.path].push_back(std::move(entry));
+   metadata.containers=std::move(rows);metadata.hasContainers=true;
+  }return metadata.containers;
+ }
+ // Only pointers that can lead to a Mesh or its owning hierarchy expand
+ // discovery. Unknown component/PPtr<Object> schemas remain conservative;
+ // terminal render resources cannot contain a Mesh's logical container.
+ static bool MeshPointer(const std::string& type){
+  if(type.compare(0,5,"PPtr<"))return false;
+  static const std::set<std::string> terminal={"PPtr<Material>","PPtr<Shader>","PPtr<Texture>","PPtr<Texture2D>",
+   "PPtr<Texture3D>","PPtr<Cubemap>","PPtr<RenderTexture>","PPtr<ComputeShader>","PPtr<MonoScript>",
+   "PPtr<Avatar>","PPtr<AudioClip>"};
+  return !terminal.count(type);
+ }
+ static bool HasMeshPointer(const Type& type,size_t node){
+  const auto& value=type.nodes.at(node);
+  if(value.type.compare(0,5,"PPtr<")==0)return MeshPointer(value.type);
+  for(auto child:value.children)if(HasMeshPointer(type,child))return true;
+  return false;
+ }
+ static bool GameBundleSource(const std::string& cab){
+  // Engine built-ins are resolved by Unity, not a CAB in the game's native
+  // dependency closure; they cannot own an authored assets/packages target.
+  auto key=SerializedAssetCabKey(cab);return key!="unity default resources"&&key!="unity_builtin_extra";
+ }
+ static void MeshReferences(const Type& type,const Value& value,const SerializedLayout& layout,
+     const std::string& cab,std::set<std::string>& result){
+  const auto& node=type.nodes.at(value.node);
+  if(node.type.compare(0,5,"PPtr<")==0){
+   if(!MeshPointer(node.type)||!Integer(Child(type,value,"m_PathID")))return;
+   auto externalIndex=Integer(Child(type,value,"m_FileID"));Require(externalIndex<=layout.externals.size(),"native Mesh discovery external index differs");
+   if(externalIndex){const auto& external=layout.externals[size_t(externalIndex)-1];
+    if(GameBundleSource(external)&&SerializedAssetCabKey(external)!=SerializedAssetCabKey(cab))result.insert(external);}
+   return;
   }
-  return index.preloadTable;
+  for(const auto& child:value.children)MeshReferences(type,child,layout,cab,result);
  }
 public:
+ std::set<std::string> MeshSources(EiemNativeRandomAccess::Reader& reader){
+  std::set<std::string> result;
+  for(const auto& member:reader.directory.members){if(!(member.flags&4))continue;
+   auto& metadata=Metadata(reader,member);const auto& layout=metadata.layout;
+   if(std::none_of(layout.externals.begin(),layout.externals.end(),GameBundleSource))continue;
+   if(!metadata.hasMeshSources){std::set<std::string> sources;std::map<size_t,std::set<std::string>> fieldsByType;
+    for(auto id:layout.order){const auto typeIndex=layout.objects.at(id).type;const auto& type=layout.types.at(typeIndex);
+     // AssetBundle preload tables mix every container's dependencies. Find()
+     // alone examines the exact requested container interval; never walk all
+     // preloads just to discover unrelated logical Meshes.
+     if(type.classId==142){
+      for(const auto& rows:Containers(reader,member))for(const auto& entry:rows.second)if(entry.asset.pathId&&GameBundleSource(entry.asset.cab)&&
+          SerializedAssetCabKey(entry.asset.cab)!=SerializedAssetCabKey(member.name))sources.insert(entry.asset.cab);
+      continue;
+     }
+     if(type.classId==21||type.classId==28||type.classId==43||type.classId==48||
+        type.classId==83||type.classId==90||type.classId==115)continue;
+     auto fields=fieldsByType.find(typeIndex);
+     if(fields==fieldsByType.end()){std::set<std::string> wanted;
+      for(auto child:type.nodes.at(0).children)if(HasMeshPointer(type,child))wanted.insert(type.nodes.at(child).name);
+      fields=fieldsByType.emplace(typeIndex,std::move(wanted)).first;}
+     if(fields->second.empty())continue;
+     for(const auto& field:reader.Fields(member,layout,id,fields->second))MeshReferences(type,field.second,layout,member.name,sources);
+    }
+    metadata.meshSources=std::move(sources);metadata.hasMeshSources=true;
+   }
+   result.insert(metadata.meshSources.begin(),metadata.meshSources.end());
+  }return result;
+ }
 bool ReferencedMesh(EiemNativeRandomAccess::Reader& reader,const NativeReference& reference,const Identity& identity,Asset& asset){
  for(const auto& member:reader.directory.members){if(!(member.flags&4)||SerializedAssetCabKey(member.name)!=SerializedAssetCabKey(reference.first))continue;
-  const auto& layout=Index(reader,member).layout;auto found=layout.objects.find(reference.second);if(found==layout.objects.end())return false;
+  const auto& layout=Layout(reader,member);auto found=layout.objects.find(reference.second);if(found==layout.objects.end())return false;
   const auto& type=layout.types.at(found->second.type);if(type.classId!=43)return false;
-  auto fields=reader.Fields(member,layout,reference.second,{"m_Name"});const auto& name=fields.at("m_Name");
-  if(Text(name.raw.data(),name.raw.size())!=identity.asset)return false;
-  asset.path=identity.path;asset.asset=identity.asset;asset.classId=43;asset.cab=member.name;asset.pathId=reference.second;asset.type=type.hash;return true;
+  auto& meshes=Metadata(reader,member).meshes;auto cached=meshes.find(reference.second);
+  if(cached==meshes.end()){auto fields=reader.Fields(member,layout,reference.second,{"m_Name"});const auto& name=fields.at("m_Name");
+    Asset value;value.asset=Text(name.raw.data(),name.raw.size());value.classId=43;value.cab=member.name;value.pathId=reference.second;value.type=type.hash;
+    cached=meshes.emplace(reference.second,std::move(value)).first;}
+  if(cached->second.asset!=identity.asset)return false;
+  asset=cached->second;asset.path=identity.path;return true;
  }return false;
 }
 template<class Resolve>
 std::vector<Asset> Find(EiemNativeRandomAccess::Reader& reader,const Identity& identity,Resolve&& resolve){
  std::map<NativeReference,Asset> matches;
- for(const auto& member:reader.directory.members){if(!(member.flags&4))continue;
-  auto& index=Index(reader,member);
-  const auto& layout=index.layout;
-  auto directRange=index.rowsByPath.equal_range(identity.path);
-  for(auto it=directRange.first;it!=directRange.second;++it){
-   const auto& row=it->second;if(row.external)continue;
-   auto target=layout.objects.find(row.pathId);if(target==layout.objects.end())continue;
-   const auto& t=layout.types.at(target->second.type);if(t.classId!=43)continue;
-   if(!std::any_of(t.nodes[0].children.begin(),t.nodes[0].children.end(),[&](size_t n){return t.nodes[n].name=="m_Name";}))continue;
-   auto name=reader.Fields(member,layout,row.pathId,{"m_Name"});const auto& v=name.at("m_Name");
-   if(Text(v.raw.data(),v.raw.size())!=identity.asset)continue;
-   Asset asset;asset.path=identity.path;asset.asset=identity.asset;asset.cab=row.cab;asset.pathId=row.pathId;asset.classId=43;asset.type=t.hash;
-   matches.emplace(NativeReference{SerializedAssetCabKey(asset.cab),asset.pathId},std::move(asset));
+ for(const auto& member:reader.directory.members){if(!(member.flags&4))continue;auto& metadata=Metadata(reader,member);const auto& layout=metadata.layout;
+  const auto& containers=Containers(reader,member);
+  auto rows=containers.find(identity.path);if(rows==containers.end())continue;
+  std::set<NativeReference> references;
+  for(const auto& entry:rows->second){
+    auto reference=NativeReference{entry.asset.cab,entry.asset.pathId};
+    Asset direct;if(reference.second&&GameBundleSource(reference.first)&&
+      (ReferencedMesh(reader,reference,identity,direct)||(SerializedAssetCabKey(reference.first)!=SerializedAssetCabKey(member.name)&&resolve(reference,identity,direct)))){
+      auto key=NativeReference{SerializedAssetCabKey(direct.cab),direct.pathId};matches.emplace(std::move(key),std::move(direct));}
+    if(!entry.preloadSize)continue;
+    auto table=metadata.preloads.find(entry.owner);if(table==metadata.preloads.end())table=metadata.preloads.emplace(entry.owner,reader.Preloads(member,layout,entry.owner)).first;
+    const auto& values=table->second;Require(entry.preloadIndex<=values.size()&&entry.preloadSize<=values.size()-entry.preloadIndex,"native container preload range differs");
+    for(size_t i=entry.preloadIndex;i<entry.preloadIndex+entry.preloadSize;++i)
+      if(values[i].second&&GameBundleSource(values[i].first))references.insert(values[i]);
   }
-  auto preloadRange=index.preloadRangesByPath.equal_range(identity.path);
-  if(preloadRange.first!=preloadRange.second){
-   const auto& table=PreloadTable(reader,member,index);
-   std::set<NativeReference> references;
-   for(auto it=preloadRange.first;it!=preloadRange.second;++it){
-    const auto& span=it->second;
-    Require(span.first<=table.size()&&span.second<=table.size()-span.first,"native container preload range differs");
-    for(size_t i=span.first;i<span.first+span.second;++i)if(table[i].second)references.insert(table[i]);
-   }
-   for(const auto& reference:references){
-    Asset asset;if(ReferencedMesh(reader,reference,identity,asset)||resolve(reference,identity,asset))
-     matches.emplace(NativeReference{SerializedAssetCabKey(asset.cab),asset.pathId},std::move(asset));
-   }
+  for(const auto& reference:references){
+   Asset asset;if(ReferencedMesh(reader,reference,identity,asset)||resolve(reference,identity,asset)){
+    auto key=NativeReference{SerializedAssetCabKey(asset.cab),asset.pathId};matches.emplace(std::move(key),std::move(asset));}
   }
  }std::vector<Asset> result;for(auto& row:matches)result.push_back(std::move(row.second));return result;
 }

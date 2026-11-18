@@ -4,7 +4,14 @@
 #include "eiem_entry_controls.h"
 namespace RuntimeMaterials {void Register(void*,void*,const RuntimeControls::Spec&);void Frame();void Forget(void*);void Install(void**,size_t);}
 namespace RuntimeAttachments {void ModelReady(void*);void QueueOwnerReady(void*);void OwnerReleasing(void*) noexcept;void Frame();}
+namespace RuntimeAnimations {void Frame(double,int);}
 namespace FullResourceReload {void HelperReady(void*);}
+#if defined(EIEM_MOD_ANIMATION_PROBE)
+namespace ModAnimationProbe {
+ void BeginFrame();void Forget(void*);
+ std::set<std::string> Apply(void*,void*,const RuntimeControls::Spec&);
+}
+#endif
 
 // Main Meshes retain native blend shapes. Only the capture consumer receives
 // a local-space, immutable, shape-evaluated copy through its Mesh getter.
@@ -205,6 +212,9 @@ bool TakeRetiredNativeIntent(void* renderer,bool& nativeEnabled) {
   return true;
 }
 void RetireRenderer(void* renderer) {
+#if defined(EIEM_MOD_ANIMATION_PROBE)
+  ModAnimationProbe::Forget(renderer);
+#endif
   auto found=bound.find(renderer);
   if(found==bound.end())return;
   try {
@@ -707,9 +717,9 @@ bool CurrentGeneration() {
   checkedGeneration=current;
   if (!graph || !controlGraph) return false;
   if(graph!=controlGraph){
-    bool same=graph->size()==controlGraph->size();
-    for(size_t i=0;same&&i<graph->size();++i)
-      same=EiemNativeInput::PackageDigest(graph->at(i))==EiemNativeInput::PackageDigest(controlGraph->at(i));
+    bool same=true;
+    for(const auto& package:*graph){auto found=std::find_if(controlGraph->begin(),controlGraph->end(),[&](const Package& p){return p.id==package.id&&p.root==package.root;});
+      same=same&&found!=controlGraph->end()&&EiemNativeInput::PackageDigest(package)==EiemNativeInput::PackageDigest(*found);}
     if(!same)Log("[CONTROL-RUNTIME-GENERATION] generation=%u committedGraphMismatch=1 activeControlsRetained=1 registrationContinues=1",current);
   }
   packageGeneration=current;
@@ -766,6 +776,9 @@ size_t RegisterRendererList(void* renderers,bool modelReady) {
   performance.hit=ready!=0;return ready;
 }
 bool GetEnabled(void* renderer) {
+  // Capture selects a visible LOD before reading its meshes. Author-hidden
+  // renderers must be excluded from that selection.
+  if(scope)return originalEnabledGetter(renderer);
   // Game code can snapshot/replay visibility at any lifecycle boundary. Its
   // read must match its last request, not our author-filtered render output.
   // Bindings are main-thread-owned; other threads never inspect these maps.
@@ -831,8 +844,12 @@ void Update() {
   auto window = GetForegroundWindow(); DWORD pid=0; GetWindowThreadProcessId(window,&pid);
   bool focused = active.load() && pid == GetCurrentProcessId();
   {EiemLoadPerformance::Scope input(EiemLoadPerformance::ControlInput);PanelCommands(focused);PollControls(focused,elapsed);}
-  {EiemLoadPerformance::Scope animation(EiemLoadPerformance::ShapeAnimation);AdvanceAnimations(elapsed);}
-  RuntimeMaterials::Frame();
+  RuntimeAnimations::Frame(elapsed,frame);
+}
+void ApplyOutputs(int frame) {
+#if defined(EIEM_MOD_ANIMATION_PROBE)
+  ModAnimationProbe::BeginFrame();
+#endif
 #if defined(EIEM_DIAGNOSTICS)
   if (traceBoundaries && frame%300==0)
     Log("[DEBUG-shape-v24-INPUT] frame=%d focusPid=%lu focused=%d packages=%zu bound=%zu delta=%.9g",
@@ -859,7 +876,14 @@ void Update() {
       auto key=it->first;++it;RetireRenderer(key);continue;
     }
     ApplyVisibility(renderer,it->second,spec,true);
+#if defined(EIEM_MOD_ANIMATION_PROBE)
+    auto nativeShapes=it->second.shapeCompatible&&it->second.modelReady?
+      ModAnimationProbe::Apply(renderer,mesh,spec):std::set<std::string>{};
+#endif
     if(it->second.shapeCompatible) for (const auto& control : spec.controls) {
+#if defined(EIEM_MOD_ANIMATION_PROBE)
+      if(nativeShapes.count(control.first))continue;
+#endif
       int index=it->second.indices.at(control.first);
       float target=float(ShapeValue(spec.package,control.second)*100.0);
       void* readArgs[]={&index};
@@ -1004,8 +1028,8 @@ void InstallOptional(void** assemblies,size_t count) {
     Require(Install(loop,"LateUpdate",{},"System.Void",false,(void*)FrameTick,(void**)&originalFrameTick),"runtime shape regular frame hook absent");
     Log("[SHAPE-RUNTIME-FRAME-API] entry=Beyond.TailGameLoop.LateUpdate perUnityFrame=1 captureIndependent=1");
     Require(Install(material,"Init",{"System.Collections.Generic.List<UnityEngine.Renderer>","System.Collections.Generic.List<Beyond.Rendering.EntityRendererTypeConfig>","Beyond.Rendering.EntityCustomizeRendererPropertyConfig","System.Boolean"},"System.Void",false,(void*)Init,(void**)&originalInit),"runtime shape registration hook absent");
-    // Capture's native code calls the resolved icall directly, rather than the
-    // managed getter wrapper. Only this getter is adapted inside a TLS scope.
+    // Capture's managed getter wrapper dispatches to this public icall.
+    // Only capture consumers receive an adapted Mesh inside a TLS scope.
     auto getter=il2cpp_resolve_icall("UnityEngine.SkinnedMeshRenderer::get_sharedMesh()");
     Require(getter && !installed.count(getter),"runtime capture shared Mesh getter unavailable");
     Require(Entry::InstallAddress(getter,"SkinnedMeshRenderer.get_sharedMesh",(void*)GetMesh,(void**)&originalMeshGetter),"runtime capture getter hook failed");

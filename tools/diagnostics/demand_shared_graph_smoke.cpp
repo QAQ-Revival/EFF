@@ -15,7 +15,8 @@ int main(){try{
     "shared dependency augmentation escaped the game load-tree request scope");
   std::map<std::string,int> dependencyCabs;std::map<std::string,uint64_t> indexedDependencies{{"CAB-shader",17}};
   std::vector<uint64_t> dependencyKeys{17,23};std::vector<uint64_t> openedDependencyKeys;
-  auto dependency=EiemDemandDependencySource::Resolve("CAB-shader",dependencyKeys,dependencyCabs,indexedDependencies,[&](uint64_t key){
+  auto noPreferred=[] {return std::vector<uint64_t>{};};
+  auto dependency=EiemDemandDependencySource::Resolve("CAB-shader",dependencyKeys,dependencyCabs,indexedDependencies,{},noPreferred,[&](uint64_t key){
     openedDependencyKeys.push_back(key);if(key==23)dependencyCabs.emplace("CAB-shader",23);});
   Require(dependency!=dependencyCabs.end()&&dependency->second==23&&openedDependencyKeys==std::vector<uint64_t>({17,23}),
     "stale CAB index blocked exact dependency-group fallback");
@@ -27,7 +28,7 @@ int main(){try{
   std::map<std::string,int> sourceDependencyCabs;std::map<std::string,uint64_t> noIndexedSourceDependencies;
   std::vector<uint64_t> openedSourceDependencyKeys;
   auto sourceDependency=EiemDemandDependencySource::Resolve("CAB-material-texture",sourceCandidates,
-      sourceDependencyCabs,noIndexedSourceDependencies,[&](uint64_t key){
+      sourceDependencyCabs,noIndexedSourceDependencies,{},noPreferred,[&](uint64_t key){
     openedSourceDependencyKeys.push_back(key);
     if(key==31)sourceDependencyCabs.emplace("CAB-material-texture",31);
   });
@@ -35,6 +36,14 @@ int main(){try{
       openedSourceDependencyKeys==std::vector<uint64_t>({17,23,31}),
     "CAB referenced by a logical source Material was outside the bounded dependency search");
   std::cout<<"PASS logical source Material CAB lookup includes its direct native dependencies without a game-wide scan\n";
+  sourceDependencyCabs.clear();openedSourceDependencyKeys.clear();
+  sourceDependency=EiemDemandDependencySource::Resolve("CAB-material-texture",sourceCandidates,
+    sourceDependencyCabs,noIndexedSourceDependencies,{17},[]{return std::vector<uint64_t>{17,99,23};},[&](uint64_t key){
+      openedSourceDependencyKeys.push_back(key);
+      if(key==31)sourceDependencyCabs.emplace("CAB-material-texture",31);
+  });
+  Require(sourceDependency!=sourceDependencyCabs.end()&&openedSourceDependencyKeys==std::vector<uint64_t>({23,31}),
+    "CAB fallback retried inspected directories or queried a preferred key outside the request");
   std::vector<std::string> lookupOrder;
   auto fallbackFound=EiemLogicalAssetLookup::Find("assets/weapon/materials/m_weapon.mat",
       [&]{lookupOrder.push_back("path");return false;},
@@ -54,6 +63,12 @@ int main(){try{
   Require(fbxFound&&lookupOrder==std::vector<std::string>({"path+asset","path"}),
       "FBX subasset lookup order or fallback differs");
   std::cout<<"PASS logical dependency lookup falls back between path and path-plus-asset indexes\n";
+  lookupOrder.clear();
+  auto namedAsset=EiemLogicalAssetLookup::Find("assets/weapon/meshes.asset",
+      [&]{lookupOrder.push_back("path");return true;},
+      [&]{lookupOrder.push_back("path+asset");return true;});
+  Require(namedAsset&&lookupOrder==std::vector<std::string>({"path+asset"}),
+      "multi-object .asset resolved the container before the declared named subasset");
   auto bytes=std::make_shared<const EiemNativeInput::Bytes>(EiemNativeInput::Bytes{1,2,3});
   auto view=std::make_shared<const EiemInputSpanView::View>(std::vector<EiemInputSpanView::Span>{{SIZE_MAX,0,bytes->size(),bytes}},std::vector<size_t>{},EiemInputSpanView::ReadRange{});
   Graph graph;Input texture{100,1,"eff/texture.ab","CAB-texture",view,{}},material{101,1,"eff/material.ab","CAB-material",view,{100,3}};

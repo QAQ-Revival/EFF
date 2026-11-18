@@ -2,7 +2,7 @@
 setlocal
 pushd "%~dp0"
 rem The installed DLL accepts Format 3 author directories only.
-rem Usage: build.bat [capture|load-perf|effects-debug].
+rem Usage: build.bat [capture|load-perf|effects-debug|animation-probe|mod-animation-probe|script-binding-probe|prefab-route-probe].
 set "entry_folder=bin\resource-directory-entry-format3"
 set "entry_capture="
 set "entry_effects="
@@ -10,8 +10,8 @@ set "entry_option=%~1"
 rem A downstream build numbers itself with EFF_VERSION_REVISION, the fourth part of the DLL version.
 set "entry_rc="
 if defined EFF_VERSION_REVISION set "entry_rc=/dEIEM_VERSION_REVISION=%EFF_VERSION_REVISION%"
-if not "%entry_option%"=="" if /i not "%entry_option%"=="capture" if /i not "%entry_option%"=="load-perf" if /i not "%entry_option%"=="effects-debug" (
- echo [ERROR] Expected capture, load-perf or effects-debug.
+if not "%entry_option%"=="" if /i not "%entry_option%"=="capture" if /i not "%entry_option%"=="load-perf" if /i not "%entry_option%"=="effects-debug" if /i not "%entry_option%"=="animation-probe" if /i not "%entry_option%"=="mod-animation-probe" if /i not "%entry_option%"=="script-binding-probe" if /i not "%entry_option%"=="prefab-route-probe" (
+ echo [ERROR] Expected capture, load-perf, effects-debug, animation-probe, mod-animation-probe, script-binding-probe or prefab-route-probe.
  goto entry_failed
 )
 if /i "%entry_option%"=="capture" (
@@ -22,6 +22,18 @@ if /i "%entry_option%"=="capture" (
 ) else if /i "%entry_option%"=="effects-debug" (
  set "entry_effects=/DEIEM_EFFECTS_DEBUG"
  set "entry_folder=%entry_folder%-effects-debug"
+) else if /i "%entry_option%"=="animation-probe" (
+ set "entry_effects=/DEIEM_NATIVE_ANIMATION_PROBE"
+ set "entry_folder=%entry_folder%-animation-probe"
+) else if /i "%entry_option%"=="mod-animation-probe" (
+ set "entry_effects=/DEIEM_MOD_ANIMATION_PROBE /DEIEM_LOAD_PERF"
+ set "entry_folder=%entry_folder%-mod-animation-probe"
+) else if /i "%entry_option%"=="script-binding-probe" (
+ set "entry_effects=/DEIEM_SCRIPT_BINDING_PROBE"
+ set "entry_folder=%entry_folder%-script-binding-probe"
+) else if /i "%entry_option%"=="prefab-route-probe" (
+ set "entry_effects=/DEIEM_PREFAB_ROUTE_PROBE"
+ set "entry_folder=%entry_folder%-prefab-route-probe"
 )
 where cl >nul 2>nul
 if errorlevel 1 (
