@@ -1,3 +1,10 @@
+# EFF v2.0.14
+
+- Fixes custom cloth physics weights being overridden by character animations. The game's own cloth groups retain their animation-driven weights.
+- Fixes compatibility with Format 3 skeletons that use an empty relative path for the root node.
+
+Download `EFF_v2.0.14_dll.zip` for Windows x64. Existing Format 3 mods remain compatible with this update.
+
 # EFF v2.0.13
 
 - Unifies effect resources, material changes and animation targets under Format 3 INI assembly, including selected-emitter export, author Empty mounts and one animation group for Shape, Bone and Material channels.
